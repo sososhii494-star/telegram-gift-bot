@@ -19,6 +19,8 @@ from telegram.ext import (
     filters,
 )
 
+import gift_account
+
 
 # =========================================================
 # НАСТРОЙКИ
@@ -331,6 +333,13 @@ def admin_keyboard():
 
         [
             InlineKeyboardButton(
+                "👤 Аккаунт выдачи",
+                callback_data="account"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
                 "🔄 Обновить подарки",
                 callback_data="refresh"
             ),
@@ -527,6 +536,129 @@ async def admin_callback(
 
         return
 
+
+    # -----------------------------------------------------
+    # АККАУНТ ВЫДАЧИ (MTProto)
+    # -----------------------------------------------------
+
+    if data == "account":
+        try:
+            status = await gift_account.account_status()
+        except Exception as e:
+            status = {"connected": True, "error": str(e), "balance": None}
+
+        if not status.get("connected"):
+            text = (
+                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
+                "🔴 Аккаунт не привязан.\n\n"
+                "После привязки обычные подарки будут покупаться "
+                "со Stars этого аккаунта через MTProto.\n\n"
+                "⚠️ Сессионные данные хранятся в PostgreSQL в зашифрованном виде."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔐 Привязать аккаунт", callback_data="account:connect")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+            ])
+        else:
+            username = f"@{status['username']}" if status.get("username") else "без username"
+            balance = (
+                f"{status['balance']} ⭐"
+                if status.get("balance") is not None
+                else "не удалось получить"
+            )
+            text = (
+                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
+                f"🟢 Подключен\n"
+                f"👤 {status.get('name', 'Аккаунт')}\n"
+                f"🔗 {username}\n"
+                f"🆔 `{status.get('user_id')}`\n"
+                f"⭐ Баланс: **{balance}**\n\n"
+                "🎁 Победные подарки будут оплачиваться именно "
+                "с этого пользовательского аккаунта, а не с баланса бота."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить баланс", callback_data="account:refresh")],
+                [InlineKeyboardButton("🔓 Отвязать аккаунт", callback_data="account:disconnect")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+            ])
+
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    if data == "account:connect":
+        context.user_data.clear()
+        context.user_data["account_step"] = "api_id"
+        await query.edit_message_text(
+            "🔐 **ПРИВЯЗКА АККАУНТА**\n\n"
+            "Шаг 1/5 — отправь **API ID** из my.telegram.org.\n\n"
+            "Не отправляй сюда BOT_TOKEN.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="account:cancel")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "account:refresh":
+        try:
+            status = await gift_account.account_status()
+            if not status.get("connected"):
+                await query.edit_message_text(
+                    "🔴 Аккаунт не привязан.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Назад", callback_data="main")]
+                    ])
+                )
+                return
+            username = f"@{status['username']}" if status.get("username") else "без username"
+            balance = status.get("balance")
+            await query.edit_message_text(
+                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
+                "🟢 Подключен\n"
+                f"👤 {status.get('name', 'Аккаунт')}\n"
+                f"🔗 {username}\n"
+                f"⭐ Баланс: **{balance if balance is not None else 'ошибка'} Stars**",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Обновить", callback_data="account:refresh")],
+                    [InlineKeyboardButton("🔓 Отвязать", callback_data="account:disconnect")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+                ]),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Не удалось получить баланс:\n`{e}`",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="account")]
+                ]),
+                parse_mode="Markdown"
+            )
+        return
+
+    if data == "account:disconnect":
+        await gift_account.clear_account()
+        context.user_data.clear()
+        await query.edit_message_text(
+            "🔓 **Аккаунт отвязан.**\n\n"
+            "Теперь бот не сможет выдавать подарки с пользовательского баланса.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔐 Привязать новый", callback_data="account:connect")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "account:cancel":
+        await gift_account.abort_login()
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ Привязка отменена.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="account")]
+            ])
+        )
+        return
 
     # -----------------------------------------------------
     # ПОДАРКИ
@@ -1220,90 +1352,70 @@ async def give_gift(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     global selected_gift_id
 
     if not update.effective_user:
         return False
 
-
     user_id = update.effective_user.id
-
+    username = update.effective_user.username
 
     try:
-
+        # Список подарков используется только для выбора gift_id.
+        # Само списание Stars выполняется через MTProto-аккаунт.
         gifts = await context.bot.get_available_gifts()
 
-
         if not gifts.gifts:
-
             stats["errors"] += 1
-
             await _db_inc_stat("errors")
             return False
 
-
         gift = None
 
-
-        # -------------------------------------------------
-        # ЕСЛИ ВЫБРАН КОНКРЕТНЫЙ ПОДАРОК
-        # -------------------------------------------------
-
         if selected_gift_id:
-
             for g in gifts.gifts:
-
-                if g.id == selected_gift_id:
-
+                if str(g.id) == str(selected_gift_id):
                     gift = g
-
                     break
 
-
-        # -------------------------------------------------
-        # ЕСЛИ НЕ НАШЛИ — АВТО
-        # -------------------------------------------------
-
         if gift is None:
+            gift = min(gifts.gifts, key=lambda g: g.star_count)
 
-            gift = min(
-                gifts.gifts,
-                key=lambda g: g.star_count
+        # MTProto-пользователь должен иметь возможность найти получателя.
+        # Для победителей без username Telegram user-id недостаточен для
+        # независимого пользовательского MTProto-сеанса.
+        recipient = f"@{username}" if username else None
+        if not recipient:
+            logging.warning(
+                "Gift not sent: winner %s has no Telegram username",
+                user_id
             )
+            stats["errors"] += 1
+            await _db_inc_stat("errors")
+            return False
 
-
-        # -------------------------------------------------
-        # ОТПРАВЛЯЕМ ПОДАРОК
-        # -------------------------------------------------
-
-        await context.bot.send_gift(
-
-            user_id=user_id,
-
-            gift_id=gift.id,
-
-            text="🎁 Поздравляем! Ты выиграл подарок!"
-
+        await gift_account.send_gift(
+            recipient=recipient,
+            gift_id=int(gift.id),
+            message="🎁 Поздравляем! Ты выиграл подарок!"
         )
 
-
         stats["gifts_sent"] += 1
-
-
         await _db_inc_stat("gifts_sent")
         return True
 
-
     except Exception as e:
-
-        logging.exception(
-            "Ошибка отправки подарка"
-        )
+        logging.exception("Ошибка отправки подарка через MTProto")
 
         stats["errors"] += 1
-
         await _db_inc_stat("errors")
+
+        # Явно отличаем нехватку Stars пользовательского аккаунта.
+        if "BALANCE_TOO_LOW" in str(e):
+            logging.error(
+                "MTProto account has insufficient Telegram Stars"
+            )
+
         return False
 
 
@@ -1329,6 +1441,118 @@ async def admin_content_handler(
     message = update.message
     if not message:
         return
+
+    # =====================================================
+    # ПРИВЯЗКА MTProto-АККАУНТА
+    # =====================================================
+    account_step = context.user_data.get("account_step")
+    if account_step:
+        text = (message.text or "").strip()
+
+        try:
+            if account_step == "api_id":
+                api_id = int(text)
+                if api_id <= 0:
+                    raise ValueError
+                context.user_data["account_api_id"] = api_id
+                context.user_data["account_step"] = "api_hash"
+                await message.reply_text(
+                    "🔐 Шаг 2/5 — отправь **API HASH**.\n\n"
+                    "Сообщение не сохраняется в историю настроек бота.",
+                    parse_mode="Markdown"
+                )
+                raise ApplicationHandlerStop
+
+            if account_step == "api_hash":
+                if len(text) < 20:
+                    await message.reply_text("❌ API HASH выглядит некорректно. Отправь его ещё раз.")
+                    raise ApplicationHandlerStop
+                context.user_data["account_api_hash"] = text
+                context.user_data["account_step"] = "phone"
+                await message.reply_text(
+                    "📱 Шаг 3/5 — отправь номер аккаунта в международном формате.\n"
+                    "Например: `+371...`",
+                    parse_mode="Markdown"
+                )
+                raise ApplicationHandlerStop
+
+            if account_step == "phone":
+                phone = text.replace(" ", "")
+                if not phone.startswith("+"):
+                    await message.reply_text("❌ Номер должен начинаться с `+`.")
+                    raise ApplicationHandlerStop
+
+                api_id = context.user_data["account_api_id"]
+                api_hash = context.user_data["account_api_hash"]
+
+                phone_code_hash = await gift_account.start_login(
+                    api_id, api_hash, phone
+                )
+                context.user_data["account_phone"] = phone
+                context.user_data["account_phone_code_hash"] = phone_code_hash
+                context.user_data["account_step"] = "code"
+
+                await message.reply_text(
+                    "📨 Шаг 4/5 — отправь код входа из Telegram.\n\n"
+                    "Если у аккаунта включена двухэтапная аутентификация, "
+                    "после кода я попрошу пароль.",
+                    parse_mode="Markdown"
+                )
+                raise ApplicationHandlerStop
+
+            if account_step == "code":
+                result = await gift_account.finish_login(
+                    context.user_data["account_phone"],
+                    text.replace(" ", ""),
+                    context.user_data["account_phone_code_hash"],
+                )
+
+                if result.get("need_password"):
+                    context.user_data["account_step"] = "password"
+                    await message.reply_text(
+                        "🔑 Шаг 5/5 — отправь пароль двухэтапной аутентификации Telegram.",
+                        parse_mode="Markdown"
+                    )
+                    raise ApplicationHandlerStop
+
+                context.user_data.clear()
+                status = await gift_account.account_status()
+                await message.reply_text(
+                    "✅ **АККАУНТ ПРИВЯЗАН!**\n\n"
+                    f"👤 {status.get('name', 'Аккаунт')}\n"
+                    f"⭐ Баланс: **{status.get('balance', 'ошибка')} Stars**\n\n"
+                    "Теперь выигрышные подарки будут оплачиваться "
+                    "с этого аккаунта.",
+                    parse_mode="Markdown"
+                )
+                raise ApplicationHandlerStop
+
+            if account_step == "password":
+                me = await gift_account.finish_login_password(text)
+                context.user_data.clear()
+                status = await gift_account.account_status()
+                await message.reply_text(
+                    "✅ **АККАУНТ ПРИВЯЗАН!**\n\n"
+                    f"👤 {status.get('name', getattr(me, 'first_name', 'Аккаунт'))}\n"
+                    f"⭐ Баланс: **{status.get('balance', 'ошибка')} Stars**\n\n"
+                    "Теперь выигрышные подарки будут оплачиваться "
+                    "с этого аккаунта.",
+                    parse_mode="Markdown"
+                )
+                raise ApplicationHandlerStop
+
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            logging.exception("MTProto account binding error")
+            await gift_account.abort_login()
+            context.user_data.clear()
+            await message.reply_text(
+                f"❌ Не удалось привязать аккаунт.\n\n`{e}`\n\n"
+                "Открой админку и попробуй привязать заново.",
+                parse_mode="Markdown"
+            )
+            raise ApplicationHandlerStop
 
     # =====================================================
     # ДОБАВЛЕНИЕ ЧАТА В ДОПУЩЕННЫЕ
@@ -1930,6 +2154,13 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
+    await gift_account.abort_login()
+    try:
+        client = await gift_account.get_client()
+        if client is not None:
+            await client.disconnect()
+    except Exception:
+        pass
     await db.close_db()
 
 
@@ -1947,6 +2178,8 @@ def main():
         Application
         .builder()
         .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -2013,7 +2246,7 @@ def main():
 
             pattern=(
                 r"^(main|chance|gifts|balance|stats|"
-                r"toggle|refresh|setchance:.*|winmessage|"
+                r"toggle|refresh|account|account:connect|account:refresh|account:disconnect|account:cancel|setchance:.*|winmessage|"
                 r"access|access_add_current|access_add_username|access_clear|access_remove:.*|"
                 r"ludka|ludka_price|ludka_prize|"
                 r"ludka_message|ludka_launch|ludka_stop)$"
