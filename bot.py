@@ -65,21 +65,19 @@ def run_web_server():
 # ADMIN
 # =========================================================
 
+# =========================================================
+# АДМИН БОТА
+# =========================================================
+
+ADMIN_ID = 7491572487
+
+
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not update.effective_chat or not update.effective_user:
+    if not update.effective_user:
         return False
 
-    try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id,
-            update.effective_user.id
-        )
-
-        return member.status in ["administrator", "creator"]
-
-    except Exception:
-        return False
+    return update.effective_user.id == ADMIN_ID
 
 
 # =========================================================
