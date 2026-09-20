@@ -112,6 +112,7 @@ ludka_entities = None
 
 # Счётчик сообщений каждого участника в текущем раунде
 ludka_progress = {}
+ludka_chat_id = None
 
 
 # =========================================================
@@ -157,6 +158,99 @@ async def is_admin(
 # =========================================================
 # ШАНС
 # =========================================================
+
+
+def _entities_to_json(entities):
+    if not entities:
+        return "[]"
+    return json.dumps([e.to_dict() for e in entities], ensure_ascii=False)
+
+
+def _entities_from_json(raw):
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        result = []
+        for item in data or []:
+            # MessageEntity fields used by Telegram/PTB.
+            kwargs = {
+                "type": item.get("type"),
+                "offset": item.get("offset", 0),
+                "length": item.get("length", 0),
+            }
+            for key in ("url", "language", "custom_emoji_id"):
+                if item.get(key) is not None:
+                    kwargs[key] = item[key]
+            result.append(MessageEntity(**kwargs))
+        return result
+    except Exception:
+        logging.exception("Failed to restore message entities")
+        return []
+
+
+async def load_persistent_state():
+    """Load all admin settings from PostgreSQL into the bot's runtime state."""
+    global selected_gift_id, giveaway_enabled, allowed_chat_ids
+    global ludka_enabled, ludka_price, ludka_prize, ludka_prize_entities
+    global ludka_text, ludka_photo, ludka_entities, ludka_chat_id
+    global win_text, win_photo, win_entities, stats, DEFAULT_CHANCE
+
+    DEFAULT_CHANCE = await db.get_float_setting("chance", DEFAULT_CHANCE)
+    selected_gift_id = await db.get_setting("selected_gift_id", None)
+    giveaway_enabled = await db.get_bool_setting("giveaway_enabled", giveaway_enabled)
+
+    allowed_chat_ids.clear()
+    allowed_chat_ids.update(await db.load_allowed_chats())
+
+    ludka_enabled = await db.get_bool_setting("ludka_enabled", ludka_enabled)
+    ludka_price = await db.get_int_setting("ludka_price", ludka_price)
+    ludka_prize = await db.get_setting("ludka_prize", ludka_prize)
+    ludka_prize_entities = _entities_from_json(
+        await db.get_setting("ludka_prize_entities", "[]")
+    )
+    ludka_text = await db.get_setting("ludka_text", ludka_text)
+    ludka_photo = await db.get_setting("ludka_photo", ludka_photo)
+    ludka_entities = _entities_from_json(
+        await db.get_setting("ludka_entities", "[]")
+    )
+    ludka_chat_id = await db.get_int_setting("ludka_chat_id", 0) or None
+
+    win_text = await db.get_setting("win_text", win_text)
+    win_photo = await db.get_setting("win_photo", win_photo)
+    win_entities = _entities_from_json(
+        await db.get_setting("win_entities", "[]")
+    )
+
+    loaded_stats = await db.load_stats()
+    stats.update(loaded_stats)
+
+    logging.info(
+        "Persistent state loaded: chance=%s, giveaway=%s, gift=%s, chats=%s",
+        DEFAULT_CHANCE, giveaway_enabled, selected_gift_id, len(allowed_chat_ids)
+    )
+
+
+async def _db_set(key, value):
+    try:
+        await db.set_setting(key, str(value) if value is not None else "")
+    except Exception:
+        logging.exception("Failed to save setting: %s", key)
+
+
+async def _db_set_entities(key, entities):
+    try:
+        await db.set_setting(key, _entities_to_json(entities))
+    except Exception:
+        logging.exception("Failed to save entities: %s", key)
+
+
+async def _db_inc_stat(name, amount=1):
+    try:
+        await db.increment_stat(name, amount)
+    except Exception:
+        logging.exception("Failed to save statistic: %s", name)
+
 
 def get_chance(context):
 
@@ -635,6 +729,7 @@ async def admin_callback(
 
     if data == "access_clear":
         allowed_chat_ids.clear()
+        await db.clear_allowed_chats()
         await query.answer("🧹 Список очищен")
         await show_access_menu(query)
         return
@@ -846,6 +941,7 @@ async def launch_ludka(query, context):
     # Если админка открыта в личке, используем последнюю группу.
     if query.message.chat.type in ("group", "supergroup"):
         ludka_chat_id = query.message.chat_id
+        await _db_set("ludka_chat_id", ludka_chat_id)
     chat_id = ludka_chat_id or query.message.chat_id
 
     try:
@@ -1048,6 +1144,7 @@ async def select_gift(
     if query.data == "gift:auto":
 
         selected_gift_id = None
+        await _db_set("selected_gift_id", "")
 
         await query.edit_message_text(
 
@@ -1134,6 +1231,7 @@ async def give_gift(
 
             stats["errors"] += 1
 
+            await _db_inc_stat("errors")
             return False
 
 
@@ -1184,6 +1282,8 @@ async def give_gift(
 
         stats["gifts_sent"] += 1
 
+
+        await _db_inc_stat("gifts_sent")
         return True
 
 
@@ -1195,6 +1295,7 @@ async def give_gift(
 
         stats["errors"] += 1
 
+        await _db_inc_stat("errors")
         return False
 
 
@@ -1278,6 +1379,7 @@ async def admin_content_handler(
                 raise ValueError
 
             ludka_price = value
+        await _db_set("ludka_price", ludka_price)
             context.user_data["waiting_ludka_price"] = False
 
             await message.reply_text(
@@ -1309,6 +1411,8 @@ async def admin_content_handler(
 
         ludka_prize = message.text
         ludka_prize_entities = message.entities or []
+        await _db_set("ludka_prize", ludka_prize)
+        await _db_set_entities("ludka_prize_entities", ludka_prize_entities)
         context.user_data["waiting_ludka_prize"] = False
 
         await message.reply_text(
@@ -1491,6 +1595,8 @@ async def message_handler(
 
     stats["messages"] += 1
 
+
+    await _db_inc_stat("messages")
     # Лудка 777 работает независимо от обычного розыгрыша
     if (
         ludka_enabled
@@ -1536,6 +1642,7 @@ async def message_handler(
     stats["wins"] += 1
 
 
+    await _db_inc_stat("wins")
     # -----------------------------------------------------
     # ПЫТАЕМСЯ ОТПРАВИТЬ ПОДАРОК
     # -----------------------------------------------------
@@ -1601,7 +1708,7 @@ async def message_handler(
 
         stats["errors"] += 1
 
-
+        await _db_inc_stat("errors")
 # =========================================================
 # ЛУДКА 777 — ИГРОВОЙ ПРОЦЕСС
 # =========================================================
@@ -1793,6 +1900,16 @@ async def start_command(
 # =========================================================
 # MAIN
 # =========================================================
+
+
+async def post_init(application):
+    await db.init_db()
+    await load_persistent_state()
+
+
+async def post_shutdown(application):
+    await db.close_db()
+
 
 def main():
 
