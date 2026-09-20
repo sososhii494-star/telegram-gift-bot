@@ -76,6 +76,33 @@ stats = {
     "errors": 0,
 }
 
+# =========================================================
+# НАСТРОЙКИ ЛУДКИ 777
+# =========================================================
+
+ludka_enabled = False
+
+# Сколько сообщений пользователя нужно для одного вращения
+ludka_price = 1
+
+# Текст приза — можно менять через админку
+ludka_prize = "подарок какой то"
+ludka_prize_entities = []
+
+# Сообщение, которое бот публикует при запуске лудки
+ludka_text = (
+    "🎰 Лудка 777 запущена!\n"
+    "🎁 Приз: подарок какой то\n"
+    "💰 Цена 1 соо: 1"
+)
+
+# Фото + Telegram entities для сообщения запуска
+ludka_photo = None
+ludka_entities = None
+
+# Счётчик сообщений каждого участника в текущем раунде
+ludka_progress = {}
+
 
 # =========================================================
 # HTTP SERVER ДЛЯ RENDER
@@ -174,6 +201,13 @@ def admin_keyboard():
             InlineKeyboardButton(
                 f"🎲 Розыгрыш: {status}",
                 callback_data="toggle"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🎰 Лудка 777",
+                callback_data="ludka"
             ),
         ],
 
@@ -549,6 +583,68 @@ async def admin_callback(
 
 
     # -----------------------------------------------------
+    # ЛУДКА 777
+    # -----------------------------------------------------
+
+    if data == "ludka":
+        await show_ludka_menu(query)
+        return
+
+    if data == "ludka_price":
+        context.user_data["waiting_ludka_price"] = True
+        await query.edit_message_text(
+            "💰 **ЦЕНА ЛУДКИ 777**\n\n"
+            "Напиши количество сообщений, которое нужно отправить "
+            "для одного вращения.\n\n"
+            "Например: `1`, `5`, `10`\n\n"
+            "❌ `/cancel` — отменить.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "ludka_prize":
+        context.user_data["waiting_ludka_prize"] = True
+        await query.edit_message_text(
+            "🎁 **ПРИЗ ЛУДКИ 777**\n\n"
+            "Отправь текст приза. Можно использовать Premium/Custom Emoji — "
+            "Telegram-форматирование сохранится.\n\n"
+            "Например:\n"
+            "`🎁 Подарок какой то`\n\n"
+            "❌ `/cancel` — отменить.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "ludka_message":
+        context.user_data["waiting_ludka_message"] = True
+        await query.edit_message_text(
+            "📝 **СООБЩЕНИЕ ЛУДКИ 777**\n\n"
+            "Отправь текст или фотографию с подписью.\n"
+            "Premium/Custom Emoji сохраняются.\n\n"
+            "Это сообщение будет публиковаться при запуске лудки.\n\n"
+            "❌ `/cancel` — отменить.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "ludka_launch":
+        await launch_ludka(query, context)
+        return
+
+    if data == "ludka_stop":
+        await stop_ludka(query, context)
+        return
+
+    # -----------------------------------------------------
     # НАСТРОЙКА СООБЩЕНИЯ ПОБЕДИТЕЛЯ
     # -----------------------------------------------------
 
@@ -580,6 +676,111 @@ async def admin_callback(
         )
 
         return
+
+
+# =========================================================
+# ЛУДКА 777 — АДМИНКА
+# =========================================================
+
+def ludka_status():
+    return "🟢 ВКЛЮЧЕНА" if ludka_enabled else "🔴 ВЫКЛЮЧЕНА"
+
+
+def ludka_menu_keyboard():
+    toggle_text = "⛔ Остановить" if ludka_enabled else "🎰 Запустить"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{toggle_text}",
+                callback_data="ludka_stop" if ludka_enabled else "ludka_launch"
+            )
+        ],
+        [
+            InlineKeyboardButton("💰 Цена", callback_data="ludka_price"),
+            InlineKeyboardButton("🎁 Приз", callback_data="ludka_prize"),
+        ],
+        [
+            InlineKeyboardButton("📝 Сообщение", callback_data="ludka_message"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Админ-панель", callback_data="main"),
+        ],
+    ])
+
+
+async def show_ludka_menu(query):
+    text = (
+        "🎰 НАСТРОЙКИ ЛУДКИ 777\n\n"
+        f"Статус: {ludka_status()}\n"
+        f"🎁 Приз: {ludka_prize}\n"
+        f"💰 Цена 1 соо: {ludka_price}\n\n"
+        "📝 Сообщение можно менять текстом или "
+        "фото + подписью. Premium/Custom Emoji сохраняются."
+    )
+    await query.edit_message_text(
+        text,
+        reply_markup=ludka_menu_keyboard(),
+        parse_mode=None
+    )
+
+
+async def launch_ludka(query, context):
+    global ludka_enabled, ludka_progress, ludka_chat_id
+
+    if not query.message:
+        return
+
+    ludka_enabled = True
+    ludka_progress = {}
+
+    # Если лудку запускают из админки в группе — запоминаем эту группу.
+    # Если админка открыта в личке, используем последнюю группу.
+    if query.message.chat.type in ("group", "supergroup"):
+        ludka_chat_id = query.message.chat_id
+    chat_id = ludka_chat_id or query.message.chat_id
+
+    try:
+        if ludka_photo:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=ludka_photo,
+                caption=ludka_text,
+                caption_entities=ludka_entities or []
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=ludka_text,
+                entities=ludka_entities or []
+            )
+
+        await query.edit_message_text(
+            "✅ **Лудка 777 запущена!**\n\n"
+            "Пользователи могут отправлять сообщения. "
+            f"Каждые **{ludka_price}** сообщений участника — одно вращение.",
+            reply_markup=ludka_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.exception("Ошибка запуска лудки")
+        await query.edit_message_text(
+            f"❌ Не удалось запустить лудку.\n\nОшибка: `{e}`",
+            reply_markup=ludka_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+
+
+async def stop_ludka(query, context):
+    global ludka_enabled, ludka_progress
+
+    ludka_enabled = False
+    ludka_progress = {}
+
+    await query.edit_message_text(
+        "⛔ **Лудка 777 остановлена.**",
+        reply_markup=ludka_menu_keyboard(),
+        parse_mode="Markdown"
+    )
 
 
 # =========================================================
@@ -897,142 +1098,188 @@ async def admin_content_handler(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    global win_text
-    global win_photo
-    global win_entities
-
+    global win_text, win_photo, win_entities
+    global ludka_text, ludka_photo, ludka_entities
+    global ludka_prize, ludka_prize_entities, ludka_price
 
     if not update.effective_user:
-
         return
-
 
     if update.effective_user.id != ADMIN_ID:
-
         return
-
-
-    # Админ сейчас ничего не настраивает
-    if not context.user_data.get(
-        "waiting_win_message"
-    ):
-
-        return
-
 
     message = update.message
-
     if not message:
-
         return
 
-
     # =====================================================
-    # ФОТО + ТЕКСТ
+    # ЦЕНА ЛУДКИ
     # =====================================================
+    if context.user_data.get("waiting_ludka_price"):
+        if not message.text:
+            await message.reply_text("❌ Отправь число, например: 1 или 5.")
+            raise ApplicationHandlerStop
 
-    if message.photo:
+        try:
+            value = int(message.text.strip())
+            if value < 1 or value > 100000:
+                raise ValueError
 
-        caption = message.caption or ""
-
-        # Telegram caption максимум 1024 символа
-        if len(caption) > 1024:
+            ludka_price = value
+            context.user_data["waiting_ludka_price"] = False
 
             await message.reply_text(
+                f"✅ Цена лудки установлена: **{ludka_price} соо**",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await message.reply_text(
+                "❌ Укажи целое число от 1 до 100000.\n"
+                "Например: `1` или `10`.",
+                parse_mode="Markdown"
+            )
 
+        raise ApplicationHandlerStop
+
+    # =====================================================
+    # ПРИЗ ЛУДКИ
+    # =====================================================
+    if context.user_data.get("waiting_ludka_prize"):
+        if not message.text:
+            await message.reply_text("❌ Отправь текст приза.")
+            raise ApplicationHandlerStop
+
+        if len(message.text) > 4096:
+            await message.reply_text(
+                "❌ Приз слишком длинный. Максимум 4096 символов."
+            )
+            raise ApplicationHandlerStop
+
+        ludka_prize = message.text
+        ludka_prize_entities = message.entities or []
+        context.user_data["waiting_ludka_prize"] = False
+
+        await message.reply_text(
+            "✅ **Приз сохранён!**\n\n"
+            f"{ludka_prize}\n\n"
+            f"✨ Premium Emoji: "
+            f"{'сохранены' if ludka_prize_entities else 'нет'}",
+            entities=ludka_prize_entities,
+            parse_mode=None
+        )
+        raise ApplicationHandlerStop
+
+    # =====================================================
+    # СООБЩЕНИЕ ЛУДКИ
+    # =====================================================
+    if context.user_data.get("waiting_ludka_message"):
+        if message.photo:
+            caption = message.caption or ""
+
+            if len(caption) > 1024:
+                await message.reply_text(
+                    "❌ Подпись слишком длинная. Для фотографии максимум 1024 символа."
+                )
+                raise ApplicationHandlerStop
+
+            ludka_photo = message.photo[-1].file_id
+            ludka_text = caption
+            ludka_entities = message.caption_entities or []
+            context.user_data["waiting_ludka_message"] = False
+
+            await message.reply_text(
+                "✅ **Сообщение лудки сохранено!**\n\n"
+                "📷 Фото: установлено\n"
+                f"📝 Текст: {ludka_text or '(без текста)'}\n"
+                f"✨ Premium Emoji: "
+                f"{'сохранены' if ludka_entities else 'нет'}",
+                parse_mode="Markdown"
+            )
+        elif message.text:
+            if len(message.text) > 4096:
+                await message.reply_text(
+                    "❌ Текст слишком длинный. Максимум 4096 символов."
+                )
+                raise ApplicationHandlerStop
+
+            ludka_text = message.text
+            ludka_photo = None
+            ludka_entities = message.entities or []
+            context.user_data["waiting_ludka_message"] = False
+
+            await message.reply_text(
+                "✅ **Сообщение лудки сохранено!**\n\n"
+                f"{ludka_text}\n\n"
+                f"✨ Premium Emoji: "
+                f"{'сохранены' if ludka_entities else 'нет'}",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.reply_text(
+                "❌ Отправь текст или фотографию с подписью."
+            )
+
+        raise ApplicationHandlerStop
+
+    # Админ сейчас ничего не настраивает.
+    if not context.user_data.get("waiting_win_message"):
+        return
+
+    # =====================================================
+    # СТАРОЕ: СООБЩЕНИЕ ПОБЕДИТЕЛЯ
+    # =====================================================
+    if message.photo:
+        caption = message.caption or ""
+
+        if len(caption) > 1024:
+            await message.reply_text(
                 "❌ Подпись слишком длинная.\n\n"
                 "Для фотографии максимум 1024 символа."
             )
-
-            return
-
+            raise ApplicationHandlerStop
 
         photo = message.photo[-1]
-
         win_photo = photo.file_id
-
         win_text = caption
-
-        # Сохраняем ВСЕ Telegram-сущности,
-        # включая Premium/Custom Emoji
         win_entities = message.caption_entities or []
 
-
-        context.user_data[
-            "waiting_win_message"
-        ] = False
-
+        context.user_data["waiting_win_message"] = False
 
         await message.reply_text(
-
             "✅ **Сообщение сохранено!**\n\n"
-
             "📷 Фото: установлено\n"
-
-            f"📝 Текст: "
-            f"{win_text or '(без текста)'}\n\n"
-
+            f"📝 Текст: {win_text or '(без текста)'}\n\n"
             "✨ Premium Emoji: "
             f"{'сохранены' if win_entities else 'нет'}",
-
             parse_mode="Markdown"
         )
-
-
-        # Останавливаем дальнейшую обработку
         raise ApplicationHandlerStop
 
-
-    # =====================================================
-    # ТОЛЬКО ТЕКСТ
-    # =====================================================
-
     if message.text:
-
         text = message.text
 
-
-        # Telegram text максимум 4096 символов
         if len(text) > 4096:
-
             await message.reply_text(
-
                 "❌ Текст слишком длинный.\n\n"
                 "Максимум 4096 символов."
             )
-
-            return
-
+            raise ApplicationHandlerStop
 
         win_text = text
-
         win_photo = None
-
-        # Сохраняем форматирование,
-        # включая Premium/Custom Emoji
         win_entities = message.entities or []
 
-
-        context.user_data[
-            "waiting_win_message"
-        ] = False
-
+        context.user_data["waiting_win_message"] = False
 
         await message.reply_text(
-
             "✅ **Текст сохранён!**\n\n"
-
             f"{win_text}\n\n"
-
             "✨ Premium Emoji: "
             f"{'сохранены' if win_entities else 'нет'}",
-
             parse_mode="Markdown"
         )
 
-
         raise ApplicationHandlerStop
-
 
 # =========================================================
 # /CANCEL
@@ -1048,12 +1295,13 @@ async def cancel_command(
         and update.effective_user.id == ADMIN_ID
     ):
 
-        context.user_data[
-            "waiting_win_message"
-        ] = False
+        context.user_data["waiting_win_message"] = False
+        context.user_data["waiting_ludka_price"] = False
+        context.user_data["waiting_ludka_prize"] = False
+        context.user_data["waiting_ludka_message"] = False
 
         await update.message.reply_text(
-            "❌ Настройка сообщения отменена."
+            "❌ Настройка отменена."
         )
 
 
@@ -1071,6 +1319,14 @@ async def message_handler(
 
 
     stats["messages"] += 1
+
+    # Лудка 777 работает независимо от обычного розыгрыша
+    if (
+        ludka_enabled
+        and update.effective_user
+        and not update.effective_user.is_bot
+    ):
+        await process_ludka_message(update, context)
 
 
     # Розыгрыш выключен
@@ -1176,6 +1432,51 @@ async def message_handler(
 
 
 # =========================================================
+# ЛУДКА 777 — ИГРОВОЙ ПРОЦЕСС
+# =========================================================
+
+async def process_ludka_message(update, context):
+    global ludka_progress
+
+    user = update.effective_user
+    if not user or not update.message:
+        return
+
+    user_id = user.id
+    count = ludka_progress.get(user_id, 0) + 1
+    ludka_progress[user_id] = count
+
+    if count < ludka_price:
+        return
+
+    # Сбрасываем накопленные сообщения перед вращением.
+    ludka_progress[user_id] = 0
+
+    # Три барабана от 1 до 7.
+    reels = [random.randint(1, 7) for _ in range(3)]
+    result = " | ".join(str(x) for x in reels)
+
+    if reels == [7, 7, 7]:
+        await update.message.reply_text(
+            "🎰 **777! ДЖЕКПОТ!**\n\n"
+            f"👤 {user.mention_html()}\n"
+            f"🎰 {result}",
+            parse_mode="Markdown"
+        )
+        # Отдельным сообщением сохраняем исходные Telegram entities приза.
+        await update.message.reply_text(
+            ludka_prize,
+            entities=ludka_prize_entities or None
+        )
+    else:
+        await update.message.reply_text(
+            f"🎰 {result}\n"
+            f"😔 Не повезло. Нужны три семёрки!\n"
+            f"💰 Цена вращения: {ludka_price} соо"
+        )
+
+
+# =========================================================
 # /CHANCE
 # =========================================================
 
@@ -1243,6 +1544,57 @@ async def chance_command(
             "/chance 1\n"
             "/chance 0.5"
         )
+
+
+# =========================================================
+# /ЛУДКА
+# =========================================================
+
+async def ludka_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ludka_enabled, ludka_progress, ludka_chat_id
+
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только администратор может управлять лудкой.")
+        return
+
+    ludka_enabled = True
+    ludka_progress = {}
+    ludka_chat_id = update.effective_chat.id
+
+    try:
+        if ludka_photo:
+            await update.message.reply_photo(
+                photo=ludka_photo,
+                caption=ludka_text,
+                caption_entities=ludka_entities or []
+            )
+        else:
+            await update.message.reply_text(
+                text=ludka_text,
+                entities=ludka_entities or []
+            )
+    except Exception:
+        logging.exception("Ошибка публикации лудки")
+        await update.message.reply_text("❌ Не удалось опубликовать лудку.")
+        return
+
+    await update.message.reply_text(
+        "🎰 Лудка **запущена**!\n\n"
+        f"🎁 Приз: {ludka_prize}\n"
+        f"💰 Цена 1 соо: {ludka_price}",
+        parse_mode="Markdown"
+    )
+
+
+async def ludkaoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ludka_enabled, ludka_progress
+
+    if not await is_admin(update, context):
+        return
+
+    ludka_enabled = False
+    ludka_progress = {}
+    await update.message.reply_text("⛔ Лудка 777 остановлена.")
 
 
 # =========================================================
@@ -1324,6 +1676,20 @@ def main():
         )
     )
 
+    app.add_handler(
+        CommandHandler(
+            "ludka",
+            ludka_command
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "ludkaoff",
+            ludkaoff_command
+        )
+    )
+
 
     # -----------------------------------------------------
     # CALLBACKS
@@ -1337,7 +1703,9 @@ def main():
 
             pattern=(
                 r"^(main|chance|gifts|balance|stats|"
-                r"toggle|refresh|setchance:.*|winmessage)$"
+                r"toggle|refresh|setchance:.*|winmessage|"
+                r"ludka|ludka_price|ludka_prize|"
+                r"ludka_message|ludka_launch|ludka_stop)$"
             )
         )
     )
