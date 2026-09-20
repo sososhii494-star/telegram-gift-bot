@@ -1,2 +1,4 @@
 python-telegram-bot>=20.0,<22.0
 asyncpg>=0.29.0,<1.0
+telethon>=1.45.0,<2.0
+cryptography>=43.0.0,<47.0
