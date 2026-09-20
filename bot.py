@@ -503,7 +503,9 @@ async def admin_callback(
             data.split(":", 1)[1]
         )
 
-        context.chat_data["chance"] = value
+        global DEFAULT_CHANCE
+        DEFAULT_CHANCE = value
+        await _db_set("chance", value)
 
         await query.edit_message_text(
 
@@ -650,6 +652,7 @@ async def admin_callback(
     if data == "toggle":
 
         giveaway_enabled = not giveaway_enabled
+        await _db_set("giveaway_enabled", giveaway_enabled)
 
         status = (
             "🟢 ВКЛЮЧЕН"
@@ -699,6 +702,7 @@ async def admin_callback(
             await query.answer("❌ Уже добавлены 2 чата. Сначала удали один.", show_alert=True)
             return
         allowed_chat_ids.add(chat.id)
+        await db.add_allowed_chat(chat.id)
         await query.answer("✅ Чат добавлен")
         await show_access_menu(query)
         return
@@ -721,6 +725,7 @@ async def admin_callback(
         try:
             chat_id = int(data.split(":", 1)[1])
             allowed_chat_ids.discard(chat_id)
+            await db.remove_allowed_chat(chat_id)
             await query.answer("🗑 Чат удалён")
         except ValueError:
             await query.answer("❌ Неверный chat ID", show_alert=True)
@@ -936,6 +941,7 @@ async def launch_ludka(query, context):
 
     ludka_enabled = True
     ludka_progress = {}
+    await _db_set("ludka_enabled", True)
 
     # Если лудку запускают из админки в группе — запоминаем эту группу.
     # Если админка открыта в личке, используем последнюю группу.
@@ -980,6 +986,7 @@ async def stop_ludka(query, context):
 
     ludka_enabled = False
     ludka_progress = {}
+    await _db_set("ludka_enabled", False)
 
     await query.edit_message_text(
         "⛔ **Лудка 777 остановлена.**",
@@ -1173,6 +1180,7 @@ async def select_gift(
         ":",
         1
     )[1]
+    await _db_set("selected_gift_id", selected_gift_id)
 
 
     await query.edit_message_text(
@@ -1379,7 +1387,7 @@ async def admin_content_handler(
                 raise ValueError
 
             ludka_price = value
-        await _db_set("ludka_price", ludka_price)
+            await _db_set("ludka_price", ludka_price)
             context.user_data["waiting_ludka_price"] = False
 
             await message.reply_text(
@@ -1441,6 +1449,9 @@ async def admin_content_handler(
             ludka_photo = message.photo[-1].file_id
             ludka_text = caption
             ludka_entities = message.caption_entities or []
+            await _db_set("ludka_photo", ludka_photo)
+            await _db_set("ludka_text", ludka_text)
+            await _db_set_entities("ludka_entities", ludka_entities)
             context.user_data["waiting_ludka_message"] = False
 
             await message.reply_text(
@@ -1461,6 +1472,9 @@ async def admin_content_handler(
             ludka_text = message.text
             ludka_photo = None
             ludka_entities = message.entities or []
+            await _db_set("ludka_photo", "")
+            await _db_set("ludka_text", ludka_text)
+            await _db_set_entities("ludka_entities", ludka_entities)
             context.user_data["waiting_ludka_message"] = False
 
             await message.reply_text(
@@ -1498,6 +1512,9 @@ async def admin_content_handler(
         win_photo = photo.file_id
         win_text = caption
         win_entities = message.caption_entities or []
+        await _db_set("win_photo", win_photo)
+        await _db_set("win_text", win_text)
+        await _db_set_entities("win_entities", win_entities)
 
         context.user_data["waiting_win_message"] = False
 
@@ -1524,6 +1541,9 @@ async def admin_content_handler(
         win_text = text
         win_photo = None
         win_entities = message.entities or []
+        await _db_set("win_photo", "")
+        await _db_set("win_text", win_text)
+        await _db_set_entities("win_entities", win_entities)
 
         context.user_data["waiting_win_message"] = False
 
@@ -1837,6 +1857,7 @@ async def ludka_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ludka_enabled = True
     ludka_progress = {}
+    await _db_set("ludka_enabled", True)
     ludka_chat_id = update.effective_chat.id
 
     try:
@@ -1872,6 +1893,7 @@ async def ludkaoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ludka_enabled = False
     ludka_progress = {}
+    await _db_set("ludka_enabled", False)
     await update.message.reply_text("⛔ Лудка 777 остановлена.")
 
 
@@ -2079,3 +2101,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
