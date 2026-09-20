@@ -77,6 +77,16 @@ stats = {
 }
 
 # =========================================================
+# ДОСТУП БОТА — МАКСИМУМ 2 ЧАТА
+# =========================================================
+
+allowed_chat_ids = set()
+ACCESS_DENIED_TEXT = (
+    "🚫 БОТ НЕ РАБОТАЕТ ТУТ БРАТ\n\n"
+    "ДОСТУП ПРИОБРЕТИ ТУТ @POLYSYMRAK"
+)
+
+# =========================================================
 # НАСТРОЙКИ ЛУДКИ 777
 # =========================================================
 
@@ -215,6 +225,13 @@ def admin_keyboard():
             InlineKeyboardButton(
                 "✏️ Сообщение победителя",
                 callback_data="winmessage"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔐 Доступные чаты (2)",
+                callback_data="access"
             ),
         ],
 
@@ -569,6 +586,60 @@ async def admin_callback(
 
 
     # -----------------------------------------------------
+    # ДОСТУПНЫЕ ЧАТЫ
+    # -----------------------------------------------------
+
+    if data == "access":
+        await show_access_menu(query)
+        return
+
+    if data == "access_add_current":
+        chat = query.message.chat if query.message else None
+        if not chat or chat.type not in ("group", "supergroup"):
+            await query.answer(
+                "Открой /admin прямо в нужной группе, чтобы добавить её.",
+                show_alert=True
+            )
+            return
+        if chat.id not in allowed_chat_ids and len(allowed_chat_ids) >= 2:
+            await query.answer("❌ Уже добавлены 2 чата. Сначала удали один.", show_alert=True)
+            return
+        allowed_chat_ids.add(chat.id)
+        await query.answer("✅ Чат добавлен")
+        await show_access_menu(query)
+        return
+
+    if data == "access_add_username":
+        context.user_data["waiting_access_chat"] = True
+        await query.edit_message_text(
+            "➕ **ДОБАВЛЕНИЕ ЧАТА**\n\n"
+            "Отправь @username группы или её chat ID.\n\n"
+            "Примеры:\n`@mygroup`\n`-1001234567890`\n\n"
+            "❌ /cancel — отменить.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="access")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data.startswith("access_remove:"):
+        try:
+            chat_id = int(data.split(":", 1)[1])
+            allowed_chat_ids.discard(chat_id)
+            await query.answer("🗑 Чат удалён")
+        except ValueError:
+            await query.answer("❌ Неверный chat ID", show_alert=True)
+        await show_access_menu(query)
+        return
+
+    if data == "access_clear":
+        allowed_chat_ids.clear()
+        await query.answer("🧹 Список очищен")
+        await show_access_menu(query)
+        return
+
+    # -----------------------------------------------------
     # ОБНОВИТЬ ПОДАРКИ
     # -----------------------------------------------------
 
@@ -677,6 +748,44 @@ async def admin_callback(
 
         return
 
+
+# =========================================================
+# ДОСТУПНЫЕ ЧАТЫ — АДМИНКА
+# =========================================================
+
+def access_menu_keyboard(current_chat=None):
+    buttons = []
+    if current_chat and current_chat.type in ("group", "supergroup"):
+        if current_chat.id not in allowed_chat_ids or len(allowed_chat_ids) < 2:
+            buttons.append([InlineKeyboardButton("➕ Привязать этот чат", callback_data="access_add_current")])
+    buttons.append([InlineKeyboardButton("➕ По @username / ID", callback_data="access_add_username")])
+    for chat_id in list(allowed_chat_ids)[:2]:
+        buttons.append([InlineKeyboardButton(f"🗑 Удалить {chat_id}", callback_data=f"access_remove:{chat_id}")])
+    if allowed_chat_ids:
+        buttons.append([InlineKeyboardButton("🧹 Очистить всё", callback_data="access_clear")])
+    buttons.append([InlineKeyboardButton("⬅️ Админ-панель", callback_data="main")])
+    return InlineKeyboardMarkup(buttons)
+
+async def show_access_menu(query):
+    current_chat = query.message.chat if query.message else None
+    lines = ["🔐 **ДОСТУПНЫЕ ЧАТЫ**", "", "Бот работает только в этих чатах:"]
+    if not allowed_chat_ids:
+        lines.append("❌ Пока ни одного чата нет.")
+    else:
+        for i, chat_id in enumerate(list(allowed_chat_ids)[:2], 1):
+            lines.append(f"{i}. `{chat_id}`")
+    lines += [
+        "",
+        f"📊 Занято: **{len(allowed_chat_ids)}/2**",
+        "",
+        "Для публичной группы можно указать @username или chat ID.",
+        "Для приватной группы открой /admin прямо в ней и нажми «Привязать этот чат»."
+    ]
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=access_menu_keyboard(current_chat),
+        parse_mode="Markdown"
+    )
 
 # =========================================================
 # ЛУДКА 777 — АДМИНКА
@@ -1113,6 +1222,49 @@ async def admin_content_handler(
         return
 
     # =====================================================
+    # ДОБАВЛЕНИЕ ЧАТА В ДОПУЩЕННЫЕ
+    # =====================================================
+    if context.user_data.get("waiting_access_chat"):
+        if not message.text:
+            await message.reply_text("❌ Отправь @username группы или числовой chat ID.")
+            raise ApplicationHandlerStop
+
+        value = message.text.strip()
+        if value.startswith("@"): 
+            try:
+                chat = await context.bot.get_chat(value)
+                if chat.type not in ("group", "supergroup"):
+                    await message.reply_text("❌ Нужна группа или супергруппа, а не личный чат/канал.")
+                    raise ApplicationHandlerStop
+                if len(allowed_chat_ids) >= 2 and chat.id not in allowed_chat_ids:
+                    await message.reply_text("❌ Уже добавлены 2 чата. Сначала удали один в админке.")
+                    raise ApplicationHandlerStop
+                allowed_chat_ids.add(chat.id)
+                context.user_data["waiting_access_chat"] = False
+                await message.reply_text(f"✅ Группа {value} добавлена.\n\nChat ID: `{chat.id}`", parse_mode="Markdown")
+            except Exception as e:
+                logging.exception("Ошибка добавления чата")
+                await message.reply_text(
+                    "❌ Не удалось найти этот чат. Проверь @username.\n\n"
+                    f"Ошибка: `{e}`", parse_mode="Markdown"
+                )
+            raise ApplicationHandlerStop
+
+        try:
+            chat_id = int(value)
+        except ValueError:
+            await message.reply_text("❌ Нужен @username или числовой chat ID.")
+            raise ApplicationHandlerStop
+
+        if len(allowed_chat_ids) >= 2 and chat_id not in allowed_chat_ids:
+            await message.reply_text("❌ Уже добавлены 2 чата. Сначала удали один в админке.")
+            raise ApplicationHandlerStop
+        allowed_chat_ids.add(chat_id)
+        context.user_data["waiting_access_chat"] = False
+        await message.reply_text(f"✅ Чат `{chat_id}` добавлен в разрешённые.", parse_mode="Markdown")
+        raise ApplicationHandlerStop
+
+    # =====================================================
     # ЦЕНА ЛУДКИ
     # =====================================================
     if context.user_data.get("waiting_ludka_price"):
@@ -1299,11 +1451,30 @@ async def cancel_command(
         context.user_data["waiting_ludka_price"] = False
         context.user_data["waiting_ludka_prize"] = False
         context.user_data["waiting_ludka_message"] = False
+        context.user_data["waiting_access_chat"] = False
 
         await update.message.reply_text(
             "❌ Настройка отменена."
         )
 
+
+# =========================================================
+# ПРОВЕРКА ДОСТУПА
+# =========================================================
+
+async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+
+    # Админ может управлять ботом в любом чате.
+    if update.effective_user and update.effective_user.id == ADMIN_ID:
+        return
+
+    chat_id = update.effective_chat.id
+    if update.effective_chat.type == "private" or chat_id not in allowed_chat_ids:
+        if update.message:
+            await update.message.reply_text(ACCESS_DENIED_TEXT)
+        raise ApplicationHandlerStop
 
 # =========================================================
 # ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
@@ -1704,6 +1875,7 @@ def main():
             pattern=(
                 r"^(main|chance|gifts|balance|stats|"
                 r"toggle|refresh|setchance:.*|winmessage|"
+                r"access|access_add_current|access_add_username|access_clear|access_remove:.*|"
                 r"ludka|ludka_price|ludka_prize|"
                 r"ludka_message|ludka_launch|ludka_stop)$"
             )
@@ -1719,6 +1891,15 @@ def main():
 
             pattern=r"^gift:"
         )
+    )
+
+
+    # -----------------------------------------------------
+    # ОГРАНИЧЕНИЕ ПО ЧАТАМ
+    # -----------------------------------------------------
+    app.add_handler(
+        MessageHandler(filters.ALL, access_guard),
+        group=-1
     )
 
 
