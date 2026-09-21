@@ -1,0 +1,4 @@
+python-telegram-bot==21.11.1
+telethon==1.41.2
+asyncpg==0.30.0
+cryptography==44.0.2
