@@ -1,26 +1,47 @@
+"""
+Telegram Gift Bot — розыгрыш подарков + Лудка 777 + магазин за Telegram Stars.
+
+Основные блоки:
+  * админ-панель (/admin)
+  * привязка пользовательского аккаунта (api_id / api_hash) для авто-выдачи подарка
+  * магазин в /start: закрыть чат (300 ⭐) и повысить шанс (1000 ⭐)
+  * поддержка жирного текста и Premium Emoji во всех настраиваемых сообщениях
+"""
+
+import asyncio
+import html
+import json
+import logging
 import os
 import random
-import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Dict, List, Optional
 
 from telegram import (
-    Update,
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
+    MessageEntity,
+    Update,
 )
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
+import db
 import gift_account
-
 
 # =========================================================
 # НАСТРОЙКИ
@@ -30,22 +51,28 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
-TOKEN = os.environ["BOT_TOKEN"]
+log = logging.getLogger("giftbot")
+
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("❌ Не задана переменная окружения BOT_TOKEN")
 
 PORT = int(os.environ.get("PORT", 10000))
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "7491572487"))
 
-DEFAULT_CHANCE = float(
-    os.environ.get("GIFT_CHANCE", "1")
-)
+# Цены в Telegram Stars
+PRICE_CLOSE_CHAT = int(os.environ.get("PRICE_CLOSE_CHAT", 300))
+PRICE_BOOST = int(os.environ.get("PRICE_BOOST", 1000))
 
-# ТВОЙ TELEGRAM ID
-ADMIN_ID = 7491572487
+# Параметры покупок
+CLOSE_MINUTES = int(os.environ.get("CLOSE_MINUTES", 10))
+BOOST_MULTIPLIER = float(os.environ.get("BOOST_MULTIPLIER", 5))
+BOOST_HOURS = float(os.environ.get("BOOST_HOURS", 24))
 
-
-# =========================================================
-# НАСТРОЙКИ СООБЩЕНИЯ ПОБЕДИТЕЛЯ
-# =========================================================
+MAX_ALLOWED_CHATS = 2
 
 DEFAULT_WIN_TEXT = (
     "🎉 Ты выиграл!\n\n"
@@ -53,68 +80,255 @@ DEFAULT_WIN_TEXT = (
     "Администратор проверит ситуацию."
 )
 
-# Текст
-win_text = DEFAULT_WIN_TEXT
-
-# Фото file_id
-win_photo = None
-
-# Premium / Custom Emoji и другое форматирование Telegram
-win_entities = None
-
-
-# =========================================================
-# СОСТОЯНИЕ БОТА
-# =========================================================
-
-selected_gift_id = None
-
-giveaway_enabled = True
-
-stats = {
-    "messages": 0,
-    "wins": 0,
-    "gifts_sent": 0,
-    "errors": 0,
-}
-
-# =========================================================
-# ДОСТУП БОТА — МАКСИМУМ 2 ЧАТА
-# =========================================================
-
-allowed_chat_ids = set()
 ACCESS_DENIED_TEXT = (
     "🚫 БОТ НЕ РАБОТАЕТ ТУТ БРАТ\n\n"
     "ДОСТУП ПРИОБРЕТИ ТУТ @POLYSYMRAK"
 )
 
-# =========================================================
-# НАСТРОЙКИ ЛУДКИ 777
-# =========================================================
-
-ludka_enabled = False
-
-# Сколько сообщений пользователя нужно для одного вращения
-ludka_price = 1
-
-# Текст приза — можно менять через админку
-ludka_prize = "подарок какой то"
-ludka_prize_entities = []
-
-# Сообщение, которое бот публикует при запуске лудки
-ludka_text = (
-    "🎰 Лудка 777 запущена!\n"
-    "🎁 Приз: подарок какой то\n"
-    "💰 Цена 1 соо: 1"
+CLOSED_PERMS = ChatPermissions(
+    can_send_messages=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+    can_change_info=False,
+    can_invite_users=True,
+    can_pin_messages=False,
 )
 
-# Фото + Telegram entities для сообщения запуска
-ludka_photo = None
-ludka_entities = None
+OPEN_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_change_info=False,
+    can_invite_users=True,
+    can_pin_messages=False,
+)
 
-# Счётчик сообщений каждого участника в текущем раунде
-ludka_progress = {}
-ludka_chat_id = None
+
+# =========================================================
+# СОСТОЯНИЕ (единый словарь вместо десятка global)
+# =========================================================
+
+S: Dict[str, object] = {
+    "chance": float(os.environ.get("GIFT_CHANCE", "1")),
+    "giveaway_enabled": True,
+    "selected_gift_id": None,
+
+    "win_text": DEFAULT_WIN_TEXT,
+    "win_photo": None,
+    "win_entities": [],
+
+    "ludka_enabled": False,
+    "ludka_price": 1,
+    "ludka_prize": "подарок какой то",
+    "ludka_prize_entities": [],
+    "ludka_text": "🎰 Лудка 777 запущена!",
+    "ludka_photo": None,
+    "ludka_entities": [],
+    "ludka_chat_id": None,
+}
+
+stats: Dict[str, int] = {"messages": 0, "wins": 0, "gifts_sent": 0, "errors": 0}
+
+allowed_chat_ids: set = set()
+
+# user_id -> {"multiplier": float, "expires_at": float}
+chance_boosts: Dict[int, Dict[str, float]] = {}
+
+# user_id -> счётчик сообщений в текущем раунде лудки (очищается, см. _prune)
+ludka_progress: Dict[int, int] = {}
+
+# chat_id -> время последнего отказа (чтобы не спамить в чужих чатах)
+_denied_notice: Dict[int, float] = {}
+
+# фоновые задачи (хранятся, иначе GC убивает их на середине)
+_tasks: set = set()
+
+_http_server: Optional[HTTPServer] = None
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def _prune(d: dict, limit: int = 5000) -> None:
+    """Защита от роста словарей в памяти на долгоживущем процессе."""
+    if len(d) > limit:
+        for key in list(d.keys())[: len(d) - limit // 2]:
+            d.pop(key, None)
+
+
+# =========================================================
+# ТЕКСТ, ЖИРНЫЙ ШРИФТ И ENTITIES
+# =========================================================
+
+def esc(value) -> str:
+    """Экранирование для ParseMode.HTML. Без него бот падал на тексте с < & *."""
+    return html.escape(str(value), quote=False)
+
+
+def b(value) -> str:
+    """Жирный текст для HTML-разметки."""
+    return f"<b>{esc(value)}</b>"
+
+
+def _u16(text: str) -> int:
+    """Длина в UTF-16 code units — именно так Telegram считает offset/length."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def parse_bold_markers(text: str):
+    """
+    Превращает **жирный** в настоящие Telegram-entities.
+    Работает, если админ не использовал встроенное форматирование Telegram.
+    """
+    if "**" not in text:
+        return text, []
+
+    parts = text.split("**")
+    if len(parts) < 3:
+        return text, []
+
+    plain = ""
+    entities: List[MessageEntity] = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1 and part:
+            entities.append(
+                MessageEntity(
+                    type=MessageEntity.BOLD,
+                    offset=_u16(plain),
+                    length=_u16(part),
+                )
+            )
+        plain += part
+    return plain, entities
+
+
+def collect_entities(message, is_caption: bool = False):
+    """
+    Забирает форматирование из сообщения админа (жирный, курсив, Premium Emoji).
+    Если форматирования нет — пробует разобрать **звёздочки**.
+    """
+    raw_text = (message.caption if is_caption else message.text) or ""
+    entities = list((message.caption_entities if is_caption else message.entities) or [])
+    if entities:
+        return raw_text, entities
+    return parse_bold_markers(raw_text)
+
+
+def _entities_to_json(entities) -> str:
+    if not entities:
+        return "[]"
+    try:
+        return json.dumps([e.to_dict() for e in entities], ensure_ascii=False)
+    except Exception:
+        log.exception("Не удалось сериализовать entities")
+        return "[]"
+
+
+def _entities_from_json(raw) -> List[MessageEntity]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        result = []
+        for item in data or []:
+            kwargs = {
+                "type": item.get("type"),
+                "offset": int(item.get("offset", 0)),
+                "length": int(item.get("length", 0)),
+            }
+            for key in ("url", "language", "custom_emoji_id"):
+                if item.get(key) is not None:
+                    kwargs[key] = item[key]
+            if kwargs["type"]:
+                result.append(MessageEntity(**kwargs))
+        return result
+    except Exception:
+        log.exception("Не удалось восстановить entities")
+        return []
+
+
+# =========================================================
+# СОХРАНЕНИЕ / ЗАГРУЗКА
+# =========================================================
+
+async def _db_set(key: str, value) -> None:
+    try:
+        await db.set_setting(key, "" if value is None else str(value))
+    except Exception:
+        log.exception("Не удалось сохранить настройку %s", key)
+
+
+async def _db_set_entities(key: str, entities) -> None:
+    try:
+        await db.set_setting(key, _entities_to_json(entities))
+    except Exception:
+        log.exception("Не удалось сохранить entities %s", key)
+
+
+async def _db_inc_stat(name: str, amount: int = 1) -> None:
+    try:
+        await db.increment_stat(name, amount)
+    except Exception:
+        log.exception("Не удалось сохранить статистику %s", name)
+
+
+async def load_persistent_state() -> None:
+    S["chance"] = await db.get_float_setting("chance", float(S["chance"]))
+    S["giveaway_enabled"] = await db.get_bool_setting("giveaway_enabled", True)
+    S["selected_gift_id"] = await db.get_setting("selected_gift_id", None)
+
+    allowed_chat_ids.clear()
+    allowed_chat_ids.update(await db.load_allowed_chats())
+
+    S["ludka_enabled"] = await db.get_bool_setting("ludka_enabled", False)
+    S["ludka_price"] = max(1, await db.get_int_setting("ludka_price", 1))
+    S["ludka_prize"] = await db.get_setting("ludka_prize", S["ludka_prize"])
+    S["ludka_prize_entities"] = _entities_from_json(
+        await db.get_setting("ludka_prize_entities", "[]")
+    )
+    S["ludka_text"] = await db.get_setting("ludka_text", S["ludka_text"])
+    S["ludka_photo"] = await db.get_setting("ludka_photo", None)
+    S["ludka_entities"] = _entities_from_json(await db.get_setting("ludka_entities", "[]"))
+    S["ludka_chat_id"] = await db.get_int_setting("ludka_chat_id", 0) or None
+
+    S["win_text"] = await db.get_setting("win_text", DEFAULT_WIN_TEXT)
+    S["win_photo"] = await db.get_setting("win_photo", None)
+    S["win_entities"] = _entities_from_json(await db.get_setting("win_entities", "[]"))
+
+    stats.update(await db.load_stats())
+    chance_boosts.clear()
+    chance_boosts.update(await db.load_active_boosts())
+
+    log.info(
+        "Состояние загружено: шанс=%s%%, розыгрыш=%s, чатов=%s, бустов=%s",
+        S["chance"], S["giveaway_enabled"], len(allowed_chat_ids), len(chance_boosts),
+    )
+
+
+# =========================================================
+# ШАНС
+# =========================================================
+
+def boost_multiplier(user_id: int) -> float:
+    boost = chance_boosts.get(user_id)
+    if not boost:
+        return 1.0
+    if boost["expires_at"] <= time.time():
+        chance_boosts.pop(user_id, None)
+        return 1.0
+    return float(boost["multiplier"])
+
+
+def get_chance(user_id: Optional[int] = None) -> float:
+    base = float(S["chance"])
+    if user_id is not None:
+        base *= boost_multiplier(user_id)
+    return min(base, 100.0)
 
 
 # =========================================================
@@ -122,702 +336,641 @@ ludka_chat_id = None
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(
-            b"Telegram Gift Bot is running!"
-        )
+        self.wfile.write(b"Telegram Gift Bot is running!")
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         pass
 
 
-def run_web_server():
-    server = HTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
-    )
-
-    server.serve_forever()
+def run_web_server() -> None:
+    global _http_server
+    try:
+        HTTPServer.allow_reuse_address = True
+        _http_server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        _http_server.serve_forever()
+    except Exception:
+        log.exception("HTTP-сервер остановлен")
 
 
 # =========================================================
 # ПРОВЕРКА АДМИНА
 # =========================================================
 
-async def is_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not update.effective_user:
-        return False
-
-    return update.effective_user.id == ADMIN_ID
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
 
 # =========================================================
-# ШАНС
+# /START — магазин за Telegram Stars
 # =========================================================
 
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(
+                f"🔒 Закрыть чат — {PRICE_CLOSE_CHAT} ⭐",
+                callback_data="buy:close",
+            )],
+            [InlineKeyboardButton(
+                f"🍀 Повысить шанс на подарок — {PRICE_BOOST} ⭐",
+                callback_data="buy:boost",
+            )],
+            [InlineKeyboardButton("📊 Мои покупки", callback_data="buy:my")],
+            [InlineKeyboardButton("ℹ️ Как это работает", callback_data="buy:help")],
+        ]
+    )
 
-def _entities_to_json(entities):
-    if not entities:
-        return "[]"
-    return json.dumps([e.to_dict() for e in entities], ensure_ascii=False)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    text = (
+        f"🎁 {b('Telegram Gift Bot')}\n\n"
+        "Бот случайно разыгрывает настоящие Telegram-подарки "
+        "среди сообщений в чате.\n\n"
+        f"🎯 Базовый шанс: {b(str(S['chance']) + '%')}\n\n"
+        f"{b('МАГАЗИН ЗА ⭐')}\n"
+        f"🔒 Закрыть чат на {CLOSE_MINUTES} мин — {b(PRICE_CLOSE_CHAT)} ⭐\n"
+        f"🍀 Шанс ×{BOOST_MULTIPLIER:g} на {BOOST_HOURS:g} ч — {b(PRICE_BOOST)} ⭐\n\n"
+        "Выбери действие ниже 👇"
+    )
+    await update.message.reply_text(
+        text, reply_markup=start_keyboard(), parse_mode=ParseMode.HTML
+    )
 
 
-def _entities_from_json(raw):
-    if not raw:
-        return []
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = update.effective_user
+
+    if data == "buy:help":
+        await query.edit_message_text(
+            f"ℹ️ {b('КАК ЭТО РАБОТАЕТ')}\n\n"
+            f"🔒 {b('Закрыть чат')} — бот запрещает писать всем участникам "
+            f"выбранного чата на {CLOSE_MINUTES} минут, затем сам открывает его обратно. "
+            "Бот должен быть администратором чата с правом ограничивать участников.\n\n"
+            f"🍀 {b('Повысить шанс')} — твой личный шанс выиграть подарок "
+            f"умножается на {BOOST_MULTIPLIER:g} и действует {BOOST_HOURS:g} часов.\n\n"
+            "Оплата проходит через Telegram Stars. Если действие не удалось "
+            "выполнить, звёзды возвращаются автоматически.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="buy:menu")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "buy:menu":
+        await query.edit_message_text(
+            f"🎁 {b('МАГАЗИН')}\n\nВыбери действие:",
+            reply_markup=start_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "buy:my":
+        mult = boost_multiplier(user.id)
+        if mult > 1:
+            left = int((chance_boosts[user.id]["expires_at"] - time.time()) / 60)
+            text = (
+                f"🍀 Активен буст ×{mult:g}\n"
+                f"⏳ Осталось: {b(str(left) + ' мин')}\n"
+                f"🎯 Твой шанс: {b(f'{get_chance(user.id):.2f}%')}"
+            )
+        else:
+            text = (
+                "У тебя нет активных покупок.\n\n"
+                f"🎯 Твой шанс: {b(f'{get_chance(user.id):.2f}%')}"
+            )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="buy:menu")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "buy:boost":
+        await send_star_invoice(
+            context,
+            chat_id=query.message.chat_id,
+            title="Повышенный шанс на подарок",
+            description=(
+                f"Шанс выиграть подарок умножается на {BOOST_MULTIPLIER:g} "
+                f"на {BOOST_HOURS:g} часов."
+            ),
+            payload="boost",
+            amount=PRICE_BOOST,
+            label="Повышенный шанс",
+        )
+        return
+
+    if data == "buy:close":
+        if not allowed_chat_ids:
+            await query.edit_message_text(
+                "❌ Ни один чат ещё не подключён к боту.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="buy:menu")]]
+                ),
+            )
+            return
+
+        if len(allowed_chat_ids) == 1:
+            chat_id = next(iter(allowed_chat_ids))
+            await _invoice_close_chat(context, query.message.chat_id, chat_id)
+            return
+
+        buttons = []
+        for chat_id in list(allowed_chat_ids)[:MAX_ALLOWED_CHATS]:
+            title = str(chat_id)
+            try:
+                chat = await context.bot.get_chat(chat_id)
+                title = chat.title or title
+            except TelegramError:
+                pass
+            buttons.append(
+                [InlineKeyboardButton(f"🔒 {title}", callback_data=f"buy:close:{chat_id}")]
+            )
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="buy:menu")])
+
+        await query.edit_message_text(
+            "Выбери чат, который нужно закрыть:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("buy:close:"):
+        try:
+            chat_id = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            await query.answer("❌ Некорректный чат", show_alert=True)
+            return
+        await _invoice_close_chat(context, query.message.chat_id, chat_id)
+        return
+
+
+async def _invoice_close_chat(context, to_chat_id: int, target_chat_id: int) -> None:
+    await send_star_invoice(
+        context,
+        chat_id=to_chat_id,
+        title="Закрытие чата",
+        description=f"Чат будет закрыт на {CLOSE_MINUTES} минут.",
+        payload=f"close:{target_chat_id}",
+        amount=PRICE_CLOSE_CHAT,
+        label=f"Закрытие чата на {CLOSE_MINUTES} мин",
+    )
+
+
+async def send_star_invoice(
+    context, chat_id: int, title: str, description: str,
+    payload: str, amount: int, label: str,
+) -> None:
     try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
-        result = []
-        for item in data or []:
-            # MessageEntity fields used by Telegram/PTB.
-            kwargs = {
-                "type": item.get("type"),
-                "offset": item.get("offset", 0),
-                "length": item.get("length", 0),
-            }
-            for key in ("url", "language", "custom_emoji_id"):
-                if item.get(key) is not None:
-                    kwargs[key] = item[key]
-            result.append(MessageEntity(**kwargs))
-        return result
-    except Exception:
-        logging.exception("Failed to restore message entities")
-        return []
-
-
-async def load_persistent_state():
-    """Load all admin settings from PostgreSQL into the bot's runtime state."""
-    global selected_gift_id, giveaway_enabled, allowed_chat_ids
-    global ludka_enabled, ludka_price, ludka_prize, ludka_prize_entities
-    global ludka_text, ludka_photo, ludka_entities, ludka_chat_id
-    global win_text, win_photo, win_entities, stats, DEFAULT_CHANCE
-
-    DEFAULT_CHANCE = await db.get_float_setting("chance", DEFAULT_CHANCE)
-    selected_gift_id = await db.get_setting("selected_gift_id", None)
-    giveaway_enabled = await db.get_bool_setting("giveaway_enabled", giveaway_enabled)
-
-    allowed_chat_ids.clear()
-    allowed_chat_ids.update(await db.load_allowed_chats())
-
-    ludka_enabled = await db.get_bool_setting("ludka_enabled", ludka_enabled)
-    ludka_price = await db.get_int_setting("ludka_price", ludka_price)
-    ludka_prize = await db.get_setting("ludka_prize", ludka_prize)
-    ludka_prize_entities = _entities_from_json(
-        await db.get_setting("ludka_prize_entities", "[]")
-    )
-    ludka_text = await db.get_setting("ludka_text", ludka_text)
-    ludka_photo = await db.get_setting("ludka_photo", ludka_photo)
-    ludka_entities = _entities_from_json(
-        await db.get_setting("ludka_entities", "[]")
-    )
-    ludka_chat_id = await db.get_int_setting("ludka_chat_id", 0) or None
-
-    win_text = await db.get_setting("win_text", win_text)
-    win_photo = await db.get_setting("win_photo", win_photo)
-    win_entities = _entities_from_json(
-        await db.get_setting("win_entities", "[]")
-    )
-
-    loaded_stats = await db.load_stats()
-    stats.update(loaded_stats)
-
-    logging.info(
-        "Persistent state loaded: chance=%s, giveaway=%s, gift=%s, chats=%s",
-        DEFAULT_CHANCE, giveaway_enabled, selected_gift_id, len(allowed_chat_ids)
-    )
-
-
-async def _db_set(key, value):
-    try:
-        await db.set_setting(key, str(value) if value is not None else "")
-    except Exception:
-        logging.exception("Failed to save setting: %s", key)
-
-
-async def _db_set_entities(key, entities):
-    try:
-        await db.set_setting(key, _entities_to_json(entities))
-    except Exception:
-        logging.exception("Failed to save entities: %s", key)
-
-
-async def _db_inc_stat(name, amount=1):
-    try:
-        await db.increment_stat(name, amount)
-    except Exception:
-        logging.exception("Failed to save statistic: %s", name)
-
-
-def get_chance(context):
-
-    value = context.chat_data.get(
-        "chance",
-        DEFAULT_CHANCE
-    )
-
-    return float(value)
-
-
-# =========================================================
-# КЛАВИАТУРА АДМИНКИ
-# =========================================================
-
-def admin_keyboard():
-
-    status = (
-        "🟢 ВКЛЮЧЕН"
-        if giveaway_enabled
-        else
-        "🔴 ВЫКЛЮЧЕН"
-    )
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🎯 Шанс",
-                callback_data="chance"
-            ),
-
-            InlineKeyboardButton(
-                "🎁 Подарки",
-                callback_data="gifts"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "💰 Stars",
-                callback_data="balance"
-            ),
-
-            InlineKeyboardButton(
-                "📊 Статистика",
-                callback_data="stats"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                f"🎲 Розыгрыш: {status}",
-                callback_data="toggle"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🎰 Лудка 777",
-                callback_data="ludka"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "✏️ Сообщение победителя",
-                callback_data="winmessage"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔐 Доступные чаты (2)",
-                callback_data="access"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "👤 Аккаунт выдачи",
-                callback_data="account"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔄 Обновить подарки",
-                callback_data="refresh"
-            ),
-        ],
-    ])
-
-
-# =========================================================
-# /ADMIN
-# =========================================================
-
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not await is_admin(update, context):
-
-        await update.message.reply_text(
-            "❌ Админ-панель доступна только владельцу бота."
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="",          # для Telegram Stars токен не нужен
+            currency="XTR",
+            prices=[LabeledPrice(label=label, amount=amount)],
+        )
+    except TelegramError:
+        log.exception("Не удалось выставить счёт (%s)", payload)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Не удалось создать счёт. Попробуй позже.",
         )
 
+
+# =========================================================
+# ПЛАТЕЖИ
+# =========================================================
+
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    payload = query.invoice_payload or ""
+
+    if payload == "boost" or payload.startswith("close:"):
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Товар больше не доступен.")
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
+    user = update.effective_user
+    payload = payment.invoice_payload or ""
+    charge_id = payment.telegram_payment_charge_id
+
+    try:
+        await db.save_payment(charge_id, user.id, payment.total_amount, payload)
+    except Exception:
+        log.exception("Не удалось сохранить платёж")
+
+    # ---------- ПОВЫШЕННЫЙ ШАНС ----------
+    if payload == "boost":
+        expires = time.time() + BOOST_HOURS * 3600
+        chance_boosts[user.id] = {"multiplier": BOOST_MULTIPLIER, "expires_at": expires}
+        _prune(chance_boosts)
+        await db.set_boost(user.id, BOOST_MULTIPLIER, expires)
+
+        await update.message.reply_text(
+            f"✅ {b('Буст активирован!')}\n\n"
+            f"🍀 Шанс ×{BOOST_MULTIPLIER:g} на {BOOST_HOURS:g} часов\n"
+            f"🎯 Твой шанс сейчас: {b(f'{get_chance(user.id):.2f}%')}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ---------- ЗАКРЫТИЕ ЧАТА ----------
+    if payload.startswith("close:"):
+        try:
+            chat_id = int(payload.split(":", 1)[1])
+        except ValueError:
+            await _refund(context, user.id, charge_id, update.message)
+            return
+
+        try:
+            await context.bot.set_chat_permissions(chat_id, CLOSED_PERMS)
+        except TelegramError as e:
+            log.exception("Не удалось закрыть чат %s", chat_id)
+            await update.message.reply_text(
+                f"❌ Не удалось закрыть чат: {esc(e)}\n\n"
+                "Скорее всего у бота нет прав администратора. "
+                "Возвращаю звёзды.",
+                parse_mode=ParseMode.HTML,
+            )
+            await _refund(context, user.id, charge_id, update.message)
+            return
+
+        await db.set_setting(f"closed_until:{chat_id}", str(time.time() + CLOSE_MINUTES * 60))
+        _spawn(_reopen_later(context, chat_id, CLOSE_MINUTES * 60))
+
+        await update.message.reply_text(
+            f"🔒 {b('Чат закрыт')} на {CLOSE_MINUTES} минут.",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            await context.bot.send_message(
+                chat_id,
+                f"🔒 {b('ЧАТ ЗАКРЫТ')}\n\n"
+                f"⏳ На {CLOSE_MINUTES} минут\n"
+                f"⭐ Оплачено: {PRICE_CLOSE_CHAT} звёзд",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    log.warning("Неизвестный payload платежа: %s", payload)
+
+
+async def _refund(context, user_id: int, charge_id: str, message=None) -> None:
+    try:
+        await context.bot.refund_star_payment(user_id, charge_id)
+        if message:
+            await message.reply_text("💸 Звёзды возвращены.")
+    except TelegramError:
+        log.exception("Не удалось вернуть звёзды по %s", charge_id)
+
+
+async def _reopen_later(context, chat_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(max(0.0, delay))
+        await context.bot.set_chat_permissions(chat_id, OPEN_PERMS)
+        await db.set_setting(f"closed_until:{chat_id}", "")
+        await context.bot.send_message(chat_id, "🔓 Чат снова открыт.")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Не удалось открыть чат %s", chat_id)
+
+
+async def restore_closed_chats(application) -> None:
+    """После рестарта бота возвращаем отложенное открытие чатов."""
+    class _Ctx:
+        bot = application.bot
+
+    for chat_id in list(allowed_chat_ids):
+        raw = await db.get_setting(f"closed_until:{chat_id}", None)
+        if not raw:
+            continue
+        try:
+            until = float(raw)
+        except ValueError:
+            continue
+        _spawn(_reopen_later(_Ctx(), chat_id, until - time.time()))
+
+
+# =========================================================
+# /BOLD — жирный текст
+# =========================================================
+
+async def bold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    text = " ".join(context.args or []).strip()
+    if not text and update.message.reply_to_message:
+        text = update.message.reply_to_message.text or ""
+
+    if not text:
+        await update.message.reply_text(
+            f"✏️ {b('ЖИРНЫЙ ТЕКСТ')}\n\n"
+            "Использование:\n"
+            "<code>/bold привет мир</code>\n\n"
+            "Либо ответь этой командой на любое сообщение.\n\n"
+            "В настройках бота можно писать <code>**вот так**</code> — "
+            "текст между звёздочками станет жирным.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text(b(text), parse_mode=ParseMode.HTML)
+
+
+# =========================================================
+# АДМИН-ПАНЕЛЬ
+# =========================================================
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    status = "🟢 ВКЛЮЧЕН" if S["giveaway_enabled"] else "🔴 ВЫКЛЮЧЕН"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🎯 Шанс", callback_data="chance"),
+                InlineKeyboardButton("🎁 Подарки", callback_data="gifts"),
+            ],
+            [
+                InlineKeyboardButton("💰 Stars", callback_data="balance"),
+                InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+            ],
+            [InlineKeyboardButton(f"🎲 Розыгрыш: {status}", callback_data="toggle")],
+            [InlineKeyboardButton("🎰 Лудка 777", callback_data="ludka")],
+            [InlineKeyboardButton("✏️ Сообщение победителя", callback_data="winmessage")],
+            [InlineKeyboardButton(
+                f"🔐 Доступные чаты ({len(allowed_chat_ids)}/{MAX_ALLOWED_CHATS})",
+                callback_data="access",
+            )],
+            [InlineKeyboardButton("👤 Аккаунт выдачи", callback_data="account")],
+            [InlineKeyboardButton("🔄 Обновить подарки", callback_data="refresh")],
+        ]
+    )
+
+
+def back_kb(target: str = "main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data=target)]]
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text("❌ Админ-панель доступна только владельцу бота.")
         return
 
     await update.message.reply_text(
-
-        "🛠 **АДМИН-ПАНЕЛЬ**\n\n"
-
-        "Здесь можно управлять:\n"
-        "🎯 шансом\n"
-        "🎁 подарками\n"
-        "💰 Stars\n"
-        "📊 статистикой\n"
-        "✏️ сообщением победителя\n\n"
-
-        "Выбери действие ниже.",
-
+        f"🛠 {b('АДМИН-ПАНЕЛЬ')}\n\nВыбери действие ниже.",
         reply_markup=admin_keyboard(),
-
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML,
     )
 
 
-# =========================================================
-# CALLBACK АДМИНКИ
-# =========================================================
-
-async def admin_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global giveaway_enabled
-    global selected_gift_id
-
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
-    if not await is_admin(update, context):
-
-        await query.answer(
-            "❌ Только для администратора.",
-            show_alert=True
-        )
-
+    if not is_admin(update):
+        await query.answer("❌ Только для администратора.", show_alert=True)
         return
 
     await query.answer()
-
     data = query.data
 
-
-    # -----------------------------------------------------
-    # ГЛАВНОЕ МЕНЮ
-    # -----------------------------------------------------
-
+    # ---------------- ГЛАВНОЕ МЕНЮ ----------------
     if data == "main":
-
         await query.edit_message_text(
-
-            "🛠 **АДМИН-ПАНЕЛЬ**\n\n"
-            "Выбери действие:",
-
+            f"🛠 {b('АДМИН-ПАНЕЛЬ')}\n\nВыбери действие:",
             reply_markup=admin_keyboard(),
-
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    # -----------------------------------------------------
-    # НАСТРОЙКА ШАНСА
-    # -----------------------------------------------------
-
+    # ---------------- ШАНС ----------------
     if data == "chance":
-
-        current = get_chance(context)
-
-        keyboard = InlineKeyboardMarkup([
-
+        keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "0.1%",
-                    callback_data="setchance:0.1"
-                ),
-
-                InlineKeyboardButton(
-                    "0.5%",
-                    callback_data="setchance:0.5"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "1%",
-                    callback_data="setchance:1"
-                ),
-
-                InlineKeyboardButton(
-                    "2%",
-                    callback_data="setchance:2"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "5%",
-                    callback_data="setchance:5"
-                ),
-
-                InlineKeyboardButton(
-                    "10%",
-                    callback_data="setchance:10"
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад",
-                    callback_data="main"
-                ),
-            ],
-        ])
-
-        await query.edit_message_text(
-
-            f"🎯 **НАСТРОЙКА ШАНСА**\n\n"
-            f"Сейчас: **{current}%**\n\n"
-            "Можно выбрать готовый вариант ниже.\n\n"
-            "Или использовать команду:\n"
-            "`/chance 0.5`\n"
-            "`/chance 1`\n"
-            "`/chance 10`",
-
-            reply_markup=keyboard,
-
-            parse_mode="Markdown"
+                [
+                    InlineKeyboardButton("0.1%", callback_data="setchance:0.1"),
+                    InlineKeyboardButton("0.5%", callback_data="setchance:0.5"),
+                ],
+                [
+                    InlineKeyboardButton("1%", callback_data="setchance:1"),
+                    InlineKeyboardButton("2%", callback_data="setchance:2"),
+                ],
+                [
+                    InlineKeyboardButton("5%", callback_data="setchance:5"),
+                    InlineKeyboardButton("10%", callback_data="setchance:10"),
+                ],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+            ]
         )
-
+        await query.edit_message_text(
+            f"🎯 {b('НАСТРОЙКА ШАНСА')}\n\n"
+            f"Сейчас: {b(str(S['chance']) + '%')}\n\n"
+            "Или команда: <code>/chance 0.5</code>",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
         return
-
-
-    # -----------------------------------------------------
-    # УСТАНОВКА ШАНСА
-    # -----------------------------------------------------
 
     if data.startswith("setchance:"):
+        try:
+            value = float(data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("❌ Некорректное значение", show_alert=True)
+            return
 
-        value = float(
-            data.split(":", 1)[1]
-        )
-
-        global DEFAULT_CHANCE
-        DEFAULT_CHANCE = value
+        S["chance"] = value
         await _db_set("chance", value)
-
         await query.edit_message_text(
-
-            f"✅ **Шанс установлен: {value}%**",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ В админ-панель",
-                        callback_data="main"
-                    )
-                ]
-
-            ]),
-
-            parse_mode="Markdown"
+            f"✅ {b(f'Шанс установлен: {value}%')}",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    # -----------------------------------------------------
-    # АККАУНТ ВЫДАЧИ (MTProto)
-    # -----------------------------------------------------
-
+    # ---------------- АККАУНТ ВЫДАЧИ ----------------
     if data == "account":
         try:
             status = await gift_account.account_status()
         except Exception as e:
-            status = {"connected": True, "error": str(e), "balance": None}
+            log.exception("Ошибка статуса аккаунта")
+            status = {"connected": False, "error": str(e)}
 
         if not status.get("connected"):
             text = (
-                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
+                f"👤 {b('АККАУНТ ВЫДАЧИ')}\n\n"
                 "🔴 Аккаунт не привязан.\n\n"
-                "После привязки обычные подарки будут покупаться "
+                "После привязки подарки победителям будут покупаться "
                 "со Stars этого аккаунта через MTProto.\n\n"
-                "⚠️ Сессионные данные хранятся в PostgreSQL в зашифрованном виде."
+                "⚠️ Сессия хранится в базе в зашифрованном виде."
             )
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔐 Привязать аккаунт", callback_data="account:connect")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
-            ])
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔐 Привязать аккаунт", callback_data="account:connect")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+                ]
+            )
         else:
             username = f"@{status['username']}" if status.get("username") else "без username"
-            balance = (
-                f"{status['balance']} ⭐"
-                if status.get("balance") is not None
-                else "не удалось получить"
-            )
+            balance = status.get("balance")
             text = (
-                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
-                f"🟢 Подключен\n"
-                f"👤 {status.get('name', 'Аккаунт')}\n"
-                f"🔗 {username}\n"
-                f"🆔 `{status.get('user_id')}`\n"
-                f"⭐ Баланс: **{balance}**\n\n"
-                "🎁 Победные подарки будут оплачиваться именно "
-                "с этого пользовательского аккаунта, а не с баланса бота."
+                f"👤 {b('АККАУНТ ВЫДАЧИ')}\n\n"
+                "🟢 Подключен\n"
+                f"👤 {esc(status.get('name', 'Аккаунт'))}\n"
+                f"🔗 {esc(username)}\n"
+                f"🆔 <code>{status.get('user_id')}</code>\n"
+                f"⭐ Баланс: {b(balance if balance is not None else 'не удалось получить')}"
             )
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Обновить баланс", callback_data="account:refresh")],
-                [InlineKeyboardButton("🔓 Отвязать аккаунт", callback_data="account:disconnect")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
-            ])
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Обновить баланс", callback_data="account:refresh")],
+                    [InlineKeyboardButton("🔓 Отвязать аккаунт", callback_data="account:disconnect")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+                ]
+            )
 
-        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         return
 
     if data == "account:connect":
-        context.user_data.clear()
+        _clear_waiting(context)
         context.user_data["account_step"] = "api_id"
         await query.edit_message_text(
-            "🔐 **ПРИВЯЗКА АККАУНТА**\n\n"
-            "Шаг 1/5 — отправь **API ID** из my.telegram.org.\n\n"
-            "Не отправляй сюда BOT_TOKEN.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Отмена", callback_data="account:cancel")]
-            ]),
-            parse_mode="Markdown"
+            f"🔐 {b('ПРИВЯЗКА АККАУНТА')}\n\n"
+            f"Шаг 1/5 — отправь {b('API ID')} с сайта my.telegram.org.\n\n"
+            "⚠️ Не отправляй сюда BOT_TOKEN.\n"
+            "❌ /cancel — отменить.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="account:cancel")]]
+            ),
+            parse_mode=ParseMode.HTML,
         )
         return
 
     if data == "account:refresh":
         try:
             status = await gift_account.account_status()
-            if not status.get("connected"):
-                await query.edit_message_text(
-                    "🔴 Аккаунт не привязан.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Назад", callback_data="main")]
-                    ])
-                )
-                return
-            username = f"@{status['username']}" if status.get("username") else "без username"
-            balance = status.get("balance")
-            await query.edit_message_text(
-                "👤 **АККАУНТ ВЫДАЧИ**\n\n"
-                "🟢 Подключен\n"
-                f"👤 {status.get('name', 'Аккаунт')}\n"
-                f"🔗 {username}\n"
-                f"⭐ Баланс: **{balance if balance is not None else 'ошибка'} Stars**",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Обновить", callback_data="account:refresh")],
-                    [InlineKeyboardButton("🔓 Отвязать", callback_data="account:disconnect")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
-                ]),
-                parse_mode="Markdown"
-            )
         except Exception as e:
             await query.edit_message_text(
-                f"❌ Не удалось получить баланс:\n`{e}`",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="account")]
-                ]),
-                parse_mode="Markdown"
+                f"❌ Не удалось получить баланс:\n<code>{esc(e)}</code>",
+                reply_markup=back_kb("account"),
+                parse_mode=ParseMode.HTML,
             )
+            return
+
+        if not status.get("connected"):
+            await query.edit_message_text("🔴 Аккаунт не привязан.", reply_markup=back_kb())
+            return
+
+        await query.edit_message_text(
+            f"👤 {b('АККАУНТ ВЫДАЧИ')}\n\n"
+            f"👤 {esc(status.get('name', 'Аккаунт'))}\n"
+            f"⭐ Баланс: {b(status.get('balance', 'ошибка'))} Stars",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Обновить", callback_data="account:refresh")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="account")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if data == "account:disconnect":
         await gift_account.clear_account()
-        context.user_data.clear()
+        _clear_waiting(context)
         await query.edit_message_text(
-            "🔓 **Аккаунт отвязан.**\n\n"
-            "Теперь бот не сможет выдавать подарки с пользовательского баланса.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔐 Привязать новый", callback_data="account:connect")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
-            ]),
-            parse_mode="Markdown"
+            f"🔓 {b('Аккаунт отвязан.')}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔐 Привязать новый", callback_data="account:connect")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
         )
         return
 
     if data == "account:cancel":
         await gift_account.abort_login()
-        context.user_data.clear()
-        await query.edit_message_text(
-            "❌ Привязка отменена.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="account")]
-            ])
-        )
+        _clear_waiting(context)
+        await query.edit_message_text("❌ Привязка отменена.", reply_markup=back_kb("account"))
         return
 
-    # -----------------------------------------------------
-    # ПОДАРКИ
-    # -----------------------------------------------------
-
-    if data == "gifts":
-
-        await show_gifts(
-            query,
-            context
-        )
-
+    # ---------------- ПОДАРКИ ----------------
+    if data in ("gifts", "refresh"):
+        await show_gifts(query, context)
         return
 
-
-    # -----------------------------------------------------
-    # STARS
-    # -----------------------------------------------------
-
+    # ---------------- БАЛАНС БОТА ----------------
     if data == "balance":
-
         try:
-
             balance = await context.bot.get_my_star_balance()
-
-            amount = balance.amount
-
+            amount = getattr(balance, "amount", balance)
             await query.edit_message_text(
-
-                "💰 **БАЛАНС БОТА**\n\n"
-                f"⭐ Stars: **{amount}**",
-
-                reply_markup=InlineKeyboardMarkup([
-
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ Назад",
-                            callback_data="main"
-                        )
-                    ]
-
-                ]),
-
-                parse_mode="Markdown"
+                f"💰 {b('БАЛАНС БОТА')}\n\n⭐ Stars: {b(amount)}\n\n"
+                "Это звёзды, полученные от продаж в /start.",
+                reply_markup=back_kb(),
+                parse_mode=ParseMode.HTML,
             )
-
         except Exception as e:
-
-            logging.exception(
-                "Ошибка получения баланса"
-            )
-
+            log.exception("Ошибка получения баланса")
             await query.edit_message_text(
-
-                "❌ Не удалось получить баланс Stars.\n\n"
-                f"Ошибка: `{e}`",
-
-                reply_markup=InlineKeyboardMarkup([
-
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ Назад",
-                            callback_data="main"
-                        )
-                    ]
-
-                ]),
-
-                parse_mode="Markdown"
+                f"❌ Не удалось получить баланс Stars.\n\n<code>{esc(e)}</code>",
+                reply_markup=back_kb(),
+                parse_mode=ParseMode.HTML,
             )
-
         return
 
-
-    # -----------------------------------------------------
-    # СТАТИСТИКА
-    # -----------------------------------------------------
-
+    # ---------------- СТАТИСТИКА ----------------
     if data == "stats":
-
-        current = get_chance(context)
-
-        text = (
-
-            "📊 **СТАТИСТИКА БОТА**\n\n"
-
-            f"💬 Сообщений: **{stats['messages']}**\n"
-            f"🎯 Срабатываний: **{stats['wins']}**\n"
-            f"🎁 Подарков отправлено: **{stats['gifts_sent']}**\n"
-            f"❌ Ошибок: **{stats['errors']}**\n\n"
-
-            f"🎯 Текущий шанс: **{current}%**\n"
-
-            f"🎁 Выбранный подарок: "
-            f"**{selected_gift_id or 'Авто'}**"
-        )
-
         await query.edit_message_text(
-
-            text,
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="main"
-                    )
-                ]
-
-            ]),
-
-            parse_mode="Markdown"
+            f"📊 {b('СТАТИСТИКА')}\n\n"
+            f"💬 Сообщений: {b(stats.get('messages', 0))}\n"
+            f"🎯 Срабатываний: {b(stats.get('wins', 0))}\n"
+            f"🎁 Подарков отправлено: {b(stats.get('gifts_sent', 0))}\n"
+            f"❌ Ошибок: {b(stats.get('errors', 0))}\n\n"
+            f"🎯 Базовый шанс: {b(str(S['chance']) + '%')}\n"
+            f"🍀 Активных бустов: {b(len(chance_boosts))}\n"
+            f"🎁 Подарок: {b(S['selected_gift_id'] or 'Авто')}",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    # -----------------------------------------------------
-    # ВКЛ / ВЫКЛ РОЗЫГРЫШ
-    # -----------------------------------------------------
-
+    # ---------------- ВКЛ/ВЫКЛ ----------------
     if data == "toggle":
-
-        giveaway_enabled = not giveaway_enabled
-        await _db_set("giveaway_enabled", giveaway_enabled)
-
-        status = (
-            "🟢 ВКЛЮЧЕН"
-            if giveaway_enabled
-            else
-            "🔴 ВЫКЛЮЧЕН"
-        )
-
+        S["giveaway_enabled"] = not S["giveaway_enabled"]
+        await _db_set("giveaway_enabled", S["giveaway_enabled"])
+        status = "🟢 ВКЛЮЧЕН" if S["giveaway_enabled"] else "🔴 ВЫКЛЮЧЕН"
         await query.edit_message_text(
-
-            f"🎲 **Розыгрыш {status}**",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ В админ-панель",
-                        callback_data="main"
-                    )
-                ]
-
-            ]),
-
-            parse_mode="Markdown"
+            f"🎲 {b('Розыгрыш ' + status)}",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    # -----------------------------------------------------
-    # ДОСТУПНЫЕ ЧАТЫ
-    # -----------------------------------------------------
-
+    # ---------------- ДОСТУПНЫЕ ЧАТЫ ----------------
     if data == "access":
         await show_access_menu(query)
         return
@@ -826,12 +979,11 @@ async def admin_callback(
         chat = query.message.chat if query.message else None
         if not chat or chat.type not in ("group", "supergroup"):
             await query.answer(
-                "Открой /admin прямо в нужной группе, чтобы добавить её.",
-                show_alert=True
+                "Открой /admin прямо в нужной группе, чтобы добавить её.", show_alert=True
             )
             return
-        if chat.id not in allowed_chat_ids and len(allowed_chat_ids) >= 2:
-            await query.answer("❌ Уже добавлены 2 чата. Сначала удали один.", show_alert=True)
+        if chat.id not in allowed_chat_ids and len(allowed_chat_ids) >= MAX_ALLOWED_CHATS:
+            await query.answer("❌ Уже добавлены 2 чата.", show_alert=True)
             return
         allowed_chat_ids.add(chat.id)
         await db.add_allowed_chat(chat.id)
@@ -840,27 +992,26 @@ async def admin_callback(
         return
 
     if data == "access_add_username":
+        _clear_waiting(context)
         context.user_data["waiting_access_chat"] = True
         await query.edit_message_text(
-            "➕ **ДОБАВЛЕНИЕ ЧАТА**\n\n"
+            f"➕ {b('ДОБАВЛЕНИЕ ЧАТА')}\n\n"
             "Отправь @username группы или её chat ID.\n\n"
-            "Примеры:\n`@mygroup`\n`-1001234567890`\n\n"
             "❌ /cancel — отменить.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="access")]
-            ]),
-            parse_mode="Markdown"
+            reply_markup=back_kb("access"),
+            parse_mode=ParseMode.HTML,
         )
         return
 
     if data.startswith("access_remove:"):
         try:
             chat_id = int(data.split(":", 1)[1])
-            allowed_chat_ids.discard(chat_id)
-            await db.remove_allowed_chat(chat_id)
-            await query.answer("🗑 Чат удалён")
         except ValueError:
             await query.answer("❌ Неверный chat ID", show_alert=True)
+            return
+        allowed_chat_ids.discard(chat_id)
+        await db.remove_allowed_chat(chat_id)
+        await query.answer("🗑 Чат удалён")
         await show_access_menu(query)
         return
 
@@ -871,71 +1022,34 @@ async def admin_callback(
         await show_access_menu(query)
         return
 
-    # -----------------------------------------------------
-    # ОБНОВИТЬ ПОДАРКИ
-    # -----------------------------------------------------
-
-    if data == "refresh":
-
-        await show_gifts(
-            query,
-            context
-        )
-
-        return
-
-
-    # -----------------------------------------------------
-    # ЛУДКА 777
-    # -----------------------------------------------------
-
+    # ---------------- ЛУДКА ----------------
     if data == "ludka":
         await show_ludka_menu(query)
         return
 
-    if data == "ludka_price":
-        context.user_data["waiting_ludka_price"] = True
+    if data in ("ludka_price", "ludka_prize", "ludka_message"):
+        _clear_waiting(context)
+        context.user_data[f"waiting_{data}"] = True
+        prompts = {
+            "ludka_price": (
+                f"💰 {b('ЦЕНА ЛУДКИ 777')}\n\n"
+                "Сколько сообщений нужно для одного вращения?\n"
+                "Например: <code>1</code>, <code>5</code>, <code>10</code>"
+            ),
+            "ludka_prize": (
+                f"🎁 {b('ПРИЗ ЛУДКИ 777')}\n\n"
+                "Отправь текст приза. Работает жирный шрифт, Premium Emoji "
+                "и <code>**звёздочки**</code>."
+            ),
+            "ludka_message": (
+                f"📝 {b('СООБЩЕНИЕ ЛУДКИ 777')}\n\n"
+                "Отправь текст или фото с подписью. Форматирование сохраняется."
+            ),
+        }
         await query.edit_message_text(
-            "💰 **ЦЕНА ЛУДКИ 777**\n\n"
-            "Напиши количество сообщений, которое нужно отправить "
-            "для одного вращения.\n\n"
-            "Например: `1`, `5`, `10`\n\n"
-            "❌ `/cancel` — отменить.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
-            ]),
-            parse_mode="Markdown"
-        )
-        return
-
-    if data == "ludka_prize":
-        context.user_data["waiting_ludka_prize"] = True
-        await query.edit_message_text(
-            "🎁 **ПРИЗ ЛУДКИ 777**\n\n"
-            "Отправь текст приза. Можно использовать Premium/Custom Emoji — "
-            "Telegram-форматирование сохранится.\n\n"
-            "Например:\n"
-            "`🎁 Подарок какой то`\n\n"
-            "❌ `/cancel` — отменить.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
-            ]),
-            parse_mode="Markdown"
-        )
-        return
-
-    if data == "ludka_message":
-        context.user_data["waiting_ludka_message"] = True
-        await query.edit_message_text(
-            "📝 **СООБЩЕНИЕ ЛУДКИ 777**\n\n"
-            "Отправь текст или фотографию с подписью.\n"
-            "Premium/Custom Emoji сохраняются.\n\n"
-            "Это сообщение будет публиковаться при запуске лудки.\n\n"
-            "❌ `/cancel` — отменить.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="ludka")]
-            ]),
-            parse_mode="Markdown"
+            prompts[data] + "\n\n❌ /cancel — отменить.",
+            reply_markup=back_kb("ludka"),
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -944,460 +1058,281 @@ async def admin_callback(
         return
 
     if data == "ludka_stop":
-        await stop_ludka(query, context)
+        await stop_ludka(query)
         return
 
-    # -----------------------------------------------------
-    # НАСТРОЙКА СООБЩЕНИЯ ПОБЕДИТЕЛЯ
-    # -----------------------------------------------------
-
+    # ---------------- СООБЩЕНИЕ ПОБЕДИТЕЛЯ ----------------
     if data == "winmessage":
-
-        context.user_data[
-            "waiting_win_message"
-        ] = True
-
+        _clear_waiting(context)
+        context.user_data["waiting_win_message"] = True
         await query.edit_message_text(
-
-            "✏️ **НАСТРОЙКА СООБЩЕНИЯ**\n\n"
-
-            "Теперь отправь мне сообщение одним из способов:\n\n"
-
-            "📝 **Только текст**\n"
-            "→ изменится текст\n\n"
-
-            "📷 **Фотография + подпись**\n"
-            "→ бот будет отправлять фото и текст\n\n"
-
-            "✨ **Premium Emoji**\n"
-            "→ просто вставь Premium/Custom Emoji "
-            "прямо в текст — Telegram-сущность сохранится.\n\n"
-
-            "❌ `/cancel` — отменить настройку.",
-
-            parse_mode="Markdown"
+            f"✏️ {b('СООБЩЕНИЕ ПОБЕДИТЕЛЯ')}\n\n"
+            "Отправь одно из:\n"
+            "📝 текст\n"
+            "📷 фото с подписью\n\n"
+            f"{b('Форматирование:')} жирный шрифт, курсив и Premium Emoji "
+            "сохраняются как есть. Можно также писать <code>**жирный**</code>.\n\n"
+            "❌ /cancel — отменить.",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
 
+def _clear_waiting(context) -> None:
+    for key in list(context.user_data.keys()):
+        if key.startswith(("waiting_", "account_")):
+            context.user_data.pop(key, None)
+
+
 # =========================================================
-# ДОСТУПНЫЕ ЧАТЫ — АДМИНКА
+# ДОСТУПНЫЕ ЧАТЫ — МЕНЮ
 # =========================================================
 
-def access_menu_keyboard(current_chat=None):
+def access_menu_keyboard(current_chat=None) -> InlineKeyboardMarkup:
     buttons = []
     if current_chat and current_chat.type in ("group", "supergroup"):
-        if current_chat.id not in allowed_chat_ids or len(allowed_chat_ids) < 2:
-            buttons.append([InlineKeyboardButton("➕ Привязать этот чат", callback_data="access_add_current")])
+        if current_chat.id in allowed_chat_ids or len(allowed_chat_ids) < MAX_ALLOWED_CHATS:
+            buttons.append(
+                [InlineKeyboardButton("➕ Привязать этот чат", callback_data="access_add_current")]
+            )
     buttons.append([InlineKeyboardButton("➕ По @username / ID", callback_data="access_add_username")])
-    for chat_id in list(allowed_chat_ids)[:2]:
-        buttons.append([InlineKeyboardButton(f"🗑 Удалить {chat_id}", callback_data=f"access_remove:{chat_id}")])
+    for chat_id in list(allowed_chat_ids)[:MAX_ALLOWED_CHATS]:
+        buttons.append(
+            [InlineKeyboardButton(f"🗑 Удалить {chat_id}", callback_data=f"access_remove:{chat_id}")]
+        )
     if allowed_chat_ids:
         buttons.append([InlineKeyboardButton("🧹 Очистить всё", callback_data="access_clear")])
     buttons.append([InlineKeyboardButton("⬅️ Админ-панель", callback_data="main")])
     return InlineKeyboardMarkup(buttons)
 
-async def show_access_menu(query):
+
+async def show_access_menu(query) -> None:
     current_chat = query.message.chat if query.message else None
-    lines = ["🔐 **ДОСТУПНЫЕ ЧАТЫ**", "", "Бот работает только в этих чатах:"]
+    lines = [f"🔐 {b('ДОСТУПНЫЕ ЧАТЫ')}", "", "Бот работает только в этих чатах:"]
     if not allowed_chat_ids:
         lines.append("❌ Пока ни одного чата нет.")
     else:
-        for i, chat_id in enumerate(list(allowed_chat_ids)[:2], 1):
-            lines.append(f"{i}. `{chat_id}`")
+        for i, chat_id in enumerate(list(allowed_chat_ids)[:MAX_ALLOWED_CHATS], 1):
+            lines.append(f"{i}. <code>{chat_id}</code>")
     lines += [
         "",
-        f"📊 Занято: **{len(allowed_chat_ids)}/2**",
+        f"📊 Занято: {b(f'{len(allowed_chat_ids)}/{MAX_ALLOWED_CHATS}')}",
         "",
-        "Для публичной группы можно указать @username или chat ID.",
-        "Для приватной группы открой /admin прямо в ней и нажми «Привязать этот чат»."
+        "Для приватной группы открой /admin прямо в ней.",
     ]
     await query.edit_message_text(
         "\n".join(lines),
         reply_markup=access_menu_keyboard(current_chat),
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML,
     )
 
+
 # =========================================================
-# ЛУДКА 777 — АДМИНКА
+# ЛУДКА 777 — МЕНЮ
 # =========================================================
 
-def ludka_status():
-    return "🟢 ВКЛЮЧЕНА" if ludka_enabled else "🔴 ВЫКЛЮЧЕНА"
-
-
-def ludka_menu_keyboard():
-    toggle_text = "⛔ Остановить" if ludka_enabled else "🎰 Запустить"
-    return InlineKeyboardMarkup([
+def ludka_menu_keyboard() -> InlineKeyboardMarkup:
+    toggle_text = "⛔ Остановить" if S["ludka_enabled"] else "🎰 Запустить"
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                f"{toggle_text}",
-                callback_data="ludka_stop" if ludka_enabled else "ludka_launch"
-            )
-        ],
-        [
-            InlineKeyboardButton("💰 Цена", callback_data="ludka_price"),
-            InlineKeyboardButton("🎁 Приз", callback_data="ludka_prize"),
-        ],
-        [
-            InlineKeyboardButton("📝 Сообщение", callback_data="ludka_message"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Админ-панель", callback_data="main"),
-        ],
-    ])
-
-
-async def show_ludka_menu(query):
-    text = (
-        "🎰 НАСТРОЙКИ ЛУДКИ 777\n\n"
-        f"Статус: {ludka_status()}\n"
-        f"🎁 Приз: {ludka_prize}\n"
-        f"💰 Цена 1 соо: {ludka_price}\n\n"
-        "📝 Сообщение можно менять текстом или "
-        "фото + подписью. Premium/Custom Emoji сохраняются."
+            [InlineKeyboardButton(
+                toggle_text,
+                callback_data="ludka_stop" if S["ludka_enabled"] else "ludka_launch",
+            )],
+            [
+                InlineKeyboardButton("💰 Цена", callback_data="ludka_price"),
+                InlineKeyboardButton("🎁 Приз", callback_data="ludka_prize"),
+            ],
+            [InlineKeyboardButton("📝 Сообщение", callback_data="ludka_message")],
+            [InlineKeyboardButton("⬅️ Админ-панель", callback_data="main")],
+        ]
     )
+
+
+async def show_ludka_menu(query) -> None:
+    status = "🟢 ВКЛЮЧЕНА" if S["ludka_enabled"] else "🔴 ВЫКЛЮЧЕНА"
     await query.edit_message_text(
-        text,
+        f"🎰 {b('НАСТРОЙКИ ЛУДКИ 777')}\n\n"
+        f"Статус: {status}\n"
+        f"🎁 Приз: {esc(S['ludka_prize'])}\n"
+        f"💰 Цена 1 вращения: {b(S['ludka_price'])} соо",
         reply_markup=ludka_menu_keyboard(),
-        parse_mode=None
+        parse_mode=ParseMode.HTML,
     )
 
 
-async def launch_ludka(query, context):
-    global ludka_enabled, ludka_progress, ludka_chat_id
-
+async def launch_ludka(query, context) -> None:
     if not query.message:
         return
 
-    ludka_enabled = True
-    ludka_progress = {}
+    S["ludka_enabled"] = True
+    ludka_progress.clear()
     await _db_set("ludka_enabled", True)
 
-    # Если лудку запускают из админки в группе — запоминаем эту группу.
-    # Если админка открыта в личке, используем последнюю группу.
     if query.message.chat.type in ("group", "supergroup"):
-        ludka_chat_id = query.message.chat_id
-        await _db_set("ludka_chat_id", ludka_chat_id)
-    chat_id = ludka_chat_id or query.message.chat_id
+        S["ludka_chat_id"] = query.message.chat_id
+        await _db_set("ludka_chat_id", S["ludka_chat_id"])
+
+    chat_id = S["ludka_chat_id"] or query.message.chat_id
 
     try:
-        if ludka_photo:
+        if S["ludka_photo"]:
             await context.bot.send_photo(
                 chat_id=chat_id,
-                photo=ludka_photo,
-                caption=ludka_text,
-                caption_entities=ludka_entities or []
+                photo=S["ludka_photo"],
+                caption=S["ludka_text"],
+                caption_entities=S["ludka_entities"] or None,
             )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=ludka_text,
-                entities=ludka_entities or []
+                text=S["ludka_text"],
+                entities=S["ludka_entities"] or None,
             )
-
         await query.edit_message_text(
-            "✅ **Лудка 777 запущена!**\n\n"
-            "Пользователи могут отправлять сообщения. "
-            f"Каждые **{ludka_price}** сообщений участника — одно вращение.",
+            f"✅ {b('Лудка 777 запущена!')}\n\n"
+            f"Каждые {b(S['ludka_price'])} сообщений участника — одно вращение.",
             reply_markup=ludka_menu_keyboard(),
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        logging.exception("Ошибка запуска лудки")
+        log.exception("Ошибка запуска лудки")
         await query.edit_message_text(
-            f"❌ Не удалось запустить лудку.\n\nОшибка: `{e}`",
+            f"❌ Не удалось запустить лудку.\n\n<code>{esc(e)}</code>",
             reply_markup=ludka_menu_keyboard(),
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML,
         )
 
 
-async def stop_ludka(query, context):
-    global ludka_enabled, ludka_progress
-
-    ludka_enabled = False
-    ludka_progress = {}
+async def stop_ludka(query) -> None:
+    S["ludka_enabled"] = False
+    ludka_progress.clear()
     await _db_set("ludka_enabled", False)
-
     await query.edit_message_text(
-        "⛔ **Лудка 777 остановлена.**",
+        f"⛔ {b('Лудка 777 остановлена.')}",
         reply_markup=ludka_menu_keyboard(),
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML,
     )
 
 
 # =========================================================
-# ПОКАЗАТЬ ПОДАРКИ
+# СПИСОК ПОДАРКОВ
 # =========================================================
 
-async def show_gifts(
-    query,
-    context
-):
-
-    global selected_gift_id
-
+async def _available_gifts(context) -> List[Dict]:
+    """Список подарков: сначала Bot API, при ошибке — через привязанный аккаунт."""
     try:
-
         gifts = await context.bot.get_available_gifts()
+        return [
+            {"id": int(g.id), "stars": int(g.star_count)}
+            for g in gifts.gifts
+            if not getattr(g, "remaining_count", None) == 0
+        ]
+    except Exception:
+        log.warning("Bot API не отдал подарки, пробую MTProto")
+        return await gift_account.list_gifts()
 
+
+async def show_gifts(query, context) -> None:
+    try:
+        gifts = await _available_gifts(context)
     except Exception as e:
-
-        logging.exception(
-            "Ошибка получения подарков"
-        )
-
+        log.exception("Ошибка получения подарков")
         await query.edit_message_text(
-
-            "❌ Не удалось получить список подарков.\n\n"
-            f"Ошибка: `{e}`",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="main"
-                    )
-                ]
-
-            ]),
-
-            parse_mode="Markdown"
+            f"❌ Не удалось получить список подарков.\n\n<code>{esc(e)}</code>",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    if not gifts.gifts:
-
+    if not gifts:
         await query.edit_message_text(
-
-            "❌ Сейчас Telegram не вернул доступные подарки.",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="main"
-                    )
-                ]
-
-            ])
+            "❌ Доступных подарков нет.", reply_markup=back_kb()
         )
-
         return
 
-
-    text = "🎁 **ДОСТУПНЫЕ ПОДАРКИ**\n\n"
-
+    gifts.sort(key=lambda g: g["stars"])
     buttons = []
-
-
-    for gift in gifts.gifts:
-
-        selected = (
-            " ✅"
-            if gift.id == selected_gift_id
-            else
-            ""
+    for g in gifts[:20]:
+        mark = "✅ " if str(g["id"]) == str(S["selected_gift_id"]) else ""
+        buttons.append(
+            [InlineKeyboardButton(f"{mark}🎁 {g['stars']} ⭐", callback_data=f"gift:{g['id']}")]
         )
-
-        text += (
-            f"🎁 ID: `{gift.id}`\n"
-            f"⭐ Цена: **{gift.star_count} Stars**"
-            f"{selected}\n\n"
-        )
-
-        buttons.append([
-
-            InlineKeyboardButton(
-
-                f"Выбрать 🎁 {gift.star_count}⭐",
-
-                callback_data=f"gift:{gift.id}"
-            )
-
-        ])
-
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "🤖 Автоматический выбор",
-            callback_data="gift:auto"
-        )
-
-    ])
-
-
-    buttons.append([
-
-        InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="main"
-        )
-
-    ])
-
+    buttons.append([InlineKeyboardButton("🤖 Автоматический выбор", callback_data="gift:auto")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
 
     await query.edit_message_text(
-
-        text,
-
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        ),
-
-        parse_mode="Markdown"
+        f"🎁 {b('ВЫБОР ПОДАРКА')}\n\n"
+        f"Сейчас: {b(S['selected_gift_id'] or 'Авто (самый дешёвый)')}\n\n"
+        "Подарок оплачивается со Stars привязанного аккаунта.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
     )
 
 
-# =========================================================
-# ВЫБОР ПОДАРКА
-# =========================================================
-
-async def select_gift(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global selected_gift_id
-
+async def select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
-    if not await is_admin(update, context):
-
-        await query.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
+    if not is_admin(update):
+        await query.answer("❌ Нет доступа.", show_alert=True)
         return
 
     await query.answer()
 
-
     if query.data == "gift:auto":
-
-        selected_gift_id = None
+        S["selected_gift_id"] = None
         await _db_set("selected_gift_id", "")
-
         await query.edit_message_text(
-
-            "🤖 **Автоматический выбор включен.**\n\n"
-            "Бот будет выбирать самый дешевый "
-            "доступный подарок.",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="gifts"
-                    )
-                ]
-
-            ]),
-
-            parse_mode="Markdown"
+            f"🤖 {b('Автоматический выбор включен.')}\n\n"
+            "Бот будет брать самый дешёвый доступный подарок.",
+            reply_markup=back_kb("gifts"),
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    selected_gift_id = query.data.split(
-        ":",
-        1
-    )[1]
-    await _db_set("selected_gift_id", selected_gift_id)
-
-
+    S["selected_gift_id"] = query.data.split(":", 1)[1]
+    await _db_set("selected_gift_id", S["selected_gift_id"])
     await query.edit_message_text(
-
-        "✅ **Подарок выбран!**\n\n"
-        f"🎁 ID: `{selected_gift_id}`\n\n"
-        "Теперь этот подарок будет использоваться "
-        "при выигрыше.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🎁 Другие подарки",
-                    callback_data="gifts"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "⬅️ Админ-панель",
-                    callback_data="main"
-                )
-            ]
-
-        ]),
-
-        parse_mode="Markdown"
+        f"✅ {b('Подарок выбран!')}\n\n🎁 ID: <code>{esc(S['selected_gift_id'])}</code>",
+        reply_markup=back_kb("gifts"),
+        parse_mode=ParseMode.HTML,
     )
 
 
 # =========================================================
-# ОТПРАВКА ПОДАРКА
+# ВЫДАЧА ПОДАРКА ПОБЕДИТЕЛЮ
 # =========================================================
 
-async def give_gift(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    global selected_gift_id
-
-    if not update.effective_user:
+async def give_gift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
         return False
 
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-
     try:
-        # Список подарков используется только для выбора gift_id.
-        # Само списание Stars выполняется через MTProto-аккаунт.
-        gifts = await context.bot.get_available_gifts()
-
-        if not gifts.gifts:
+        gifts = await _available_gifts(context)
+        if not gifts:
+            log.error("Нет доступных подарков для выдачи")
             stats["errors"] += 1
             await _db_inc_stat("errors")
             return False
 
         gift = None
-
-        if selected_gift_id:
-            for g in gifts.gifts:
-                if str(g.id) == str(selected_gift_id):
-                    gift = g
-                    break
-
-        if gift is None:
-            gift = min(gifts.gifts, key=lambda g: g.star_count)
-
-        # MTProto-пользователь должен иметь возможность найти получателя.
-        # Для победителей без username Telegram user-id недостаточен для
-        # независимого пользовательского MTProto-сеанса.
-        recipient = f"@{username}" if username else None
-        if not recipient:
-            logging.warning(
-                "Gift not sent: winner %s has no Telegram username",
-                user_id
+        if S["selected_gift_id"]:
+            gift = next(
+                (g for g in gifts if str(g["id"]) == str(S["selected_gift_id"])), None
             )
-            stats["errors"] += 1
-            await _db_inc_stat("errors")
-            return False
+        if gift is None:
+            gift = min(gifts, key=lambda g: g["stars"])
+
+        # Аккаунт-отправитель проще всего находит получателя по @username,
+        # но если его нет — пробуем числовой user_id.
+        recipient = f"@{user.username}" if user.username else user.id
 
         await gift_account.send_gift(
             recipient=recipient,
-            gift_id=int(gift.id),
-            message="🎁 Поздравляем! Ты выиграл подарок!"
+            gift_id=int(gift["id"]),
+            message="🎁 Поздравляем! Ты выиграл подарок!",
         )
 
         stats["gifts_sent"] += 1
@@ -1405,404 +1340,416 @@ async def give_gift(
         return True
 
     except Exception as e:
-        logging.exception("Ошибка отправки подарка через MTProto")
-
+        log.exception("Ошибка отправки подарка через MTProto")
         stats["errors"] += 1
         await _db_inc_stat("errors")
 
-        # Явно отличаем нехватку Stars пользовательского аккаунта.
-        if "BALANCE_TOO_LOW" in str(e):
-            logging.error(
-                "MTProto account has insufficient Telegram Stars"
+        text = str(e)
+        if "BALANCE_TOO_LOW" in text:
+            log.error("На привязанном аккаунте не хватает Stars")
+            await _notify_admin(context, "⚠️ Не хватает Stars на аккаунте выдачи.")
+        elif "не привязан" in text:
+            await _notify_admin(context, "⚠️ Аккаунт выдачи не привязан — подарок не отправлен.")
+        elif "PEER_ID_INVALID" in text or "Cannot find any entity" in text:
+            await _notify_admin(
+                context,
+                f"⚠️ Аккаунт выдачи не видит победителя (id {user.id}). "
+                "Нужен @username или общий чат.",
             )
-
         return False
 
 
+async def _notify_admin(context, text: str) -> None:
+    try:
+        await context.bot.send_message(ADMIN_ID, text)
+    except TelegramError:
+        pass
+
+
 # =========================================================
-# НАСТРОЙКА СООБЩЕНИЯ АДМИНОМ
+# ВВОД АДМИНА (настройки, привязка аккаунта)
 # =========================================================
 
-async def admin_content_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    global win_text, win_photo, win_entities
-    global ludka_text, ludka_photo, ludka_entities
-    global ludka_prize, ludka_prize_entities, ludka_price
-
-    if not update.effective_user:
-        return
-
-    if update.effective_user.id != ADMIN_ID:
+async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update) or not update.message:
         return
 
     message = update.message
-    if not message:
-        return
 
-    # =====================================================
-    # ПРИВЯЗКА MTProto-АККАУНТА
-    # =====================================================
+    # ---------- ПРИВЯЗКА MTProto ----------
     account_step = context.user_data.get("account_step")
     if account_step:
-        text = (message.text or "").strip()
+        await _handle_account_step(account_step, message, context)
+        raise ApplicationHandlerStop
 
-        try:
-            if account_step == "api_id":
-                api_id = int(text)
-                if api_id <= 0:
-                    raise ValueError
-                context.user_data["account_api_id"] = api_id
-                context.user_data["account_step"] = "api_hash"
-                await message.reply_text(
-                    "🔐 Шаг 2/5 — отправь **API HASH**.\n\n"
-                    "Сообщение не сохраняется в историю настроек бота.",
-                    parse_mode="Markdown"
-                )
-                raise ApplicationHandlerStop
-
-            if account_step == "api_hash":
-                if len(text) < 20:
-                    await message.reply_text("❌ API HASH выглядит некорректно. Отправь его ещё раз.")
-                    raise ApplicationHandlerStop
-                context.user_data["account_api_hash"] = text
-                context.user_data["account_step"] = "phone"
-                await message.reply_text(
-                    "📱 Шаг 3/5 — отправь номер аккаунта в международном формате.\n"
-                    "Например: `+371...`",
-                    parse_mode="Markdown"
-                )
-                raise ApplicationHandlerStop
-
-            if account_step == "phone":
-                phone = text.replace(" ", "")
-                if not phone.startswith("+"):
-                    await message.reply_text("❌ Номер должен начинаться с `+`.")
-                    raise ApplicationHandlerStop
-
-                api_id = context.user_data["account_api_id"]
-                api_hash = context.user_data["account_api_hash"]
-
-                phone_code_hash = await gift_account.start_login(
-                    api_id, api_hash, phone
-                )
-                context.user_data["account_phone"] = phone
-                context.user_data["account_phone_code_hash"] = phone_code_hash
-                context.user_data["account_step"] = "code"
-
-                await message.reply_text(
-                    "📨 Шаг 4/5 — отправь код входа из Telegram.\n\n"
-                    "Если у аккаунта включена двухэтапная аутентификация, "
-                    "после кода я попрошу пароль.",
-                    parse_mode="Markdown"
-                )
-                raise ApplicationHandlerStop
-
-            if account_step == "code":
-                result = await gift_account.finish_login(
-                    context.user_data["account_phone"],
-                    text.replace(" ", ""),
-                    context.user_data["account_phone_code_hash"],
-                )
-
-                if result.get("need_password"):
-                    context.user_data["account_step"] = "password"
-                    await message.reply_text(
-                        "🔑 Шаг 5/5 — отправь пароль двухэтапной аутентификации Telegram.",
-                        parse_mode="Markdown"
-                    )
-                    raise ApplicationHandlerStop
-
-                context.user_data.clear()
-                status = await gift_account.account_status()
-                await message.reply_text(
-                    "✅ **АККАУНТ ПРИВЯЗАН!**\n\n"
-                    f"👤 {status.get('name', 'Аккаунт')}\n"
-                    f"⭐ Баланс: **{status.get('balance', 'ошибка')} Stars**\n\n"
-                    "Теперь выигрышные подарки будут оплачиваться "
-                    "с этого аккаунта.",
-                    parse_mode="Markdown"
-                )
-                raise ApplicationHandlerStop
-
-            if account_step == "password":
-                me = await gift_account.finish_login_password(text)
-                context.user_data.clear()
-                status = await gift_account.account_status()
-                await message.reply_text(
-                    "✅ **АККАУНТ ПРИВЯЗАН!**\n\n"
-                    f"👤 {status.get('name', getattr(me, 'first_name', 'Аккаунт'))}\n"
-                    f"⭐ Баланс: **{status.get('balance', 'ошибка')} Stars**\n\n"
-                    "Теперь выигрышные подарки будут оплачиваться "
-                    "с этого аккаунта.",
-                    parse_mode="Markdown"
-                )
-                raise ApplicationHandlerStop
-
-        except ApplicationHandlerStop:
-            raise
-        except Exception as e:
-            logging.exception("MTProto account binding error")
-            await gift_account.abort_login()
-            context.user_data.clear()
-            await message.reply_text(
-                f"❌ Не удалось привязать аккаунт.\n\n`{e}`\n\n"
-                "Открой админку и попробуй привязать заново.",
-                parse_mode="Markdown"
-            )
-            raise ApplicationHandlerStop
-
-    # =====================================================
-    # ДОБАВЛЕНИЕ ЧАТА В ДОПУЩЕННЫЕ
-    # =====================================================
+    # ---------- ДОБАВЛЕНИЕ ЧАТА ----------
     if context.user_data.get("waiting_access_chat"):
-        if not message.text:
-            await message.reply_text("❌ Отправь @username группы или числовой chat ID.")
-            raise ApplicationHandlerStop
-
-        value = message.text.strip()
-        if value.startswith("@"): 
-            try:
-                chat = await context.bot.get_chat(value)
-                if chat.type not in ("group", "supergroup"):
-                    await message.reply_text("❌ Нужна группа или супергруппа, а не личный чат/канал.")
-                    raise ApplicationHandlerStop
-                if len(allowed_chat_ids) >= 2 and chat.id not in allowed_chat_ids:
-                    await message.reply_text("❌ Уже добавлены 2 чата. Сначала удали один в админке.")
-                    raise ApplicationHandlerStop
-                allowed_chat_ids.add(chat.id)
-                context.user_data["waiting_access_chat"] = False
-                await message.reply_text(f"✅ Группа {value} добавлена.\n\nChat ID: `{chat.id}`", parse_mode="Markdown")
-            except Exception as e:
-                logging.exception("Ошибка добавления чата")
-                await message.reply_text(
-                    "❌ Не удалось найти этот чат. Проверь @username.\n\n"
-                    f"Ошибка: `{e}`", parse_mode="Markdown"
-                )
-            raise ApplicationHandlerStop
-
-        try:
-            chat_id = int(value)
-        except ValueError:
-            await message.reply_text("❌ Нужен @username или числовой chat ID.")
-            raise ApplicationHandlerStop
-
-        if len(allowed_chat_ids) >= 2 and chat_id not in allowed_chat_ids:
-            await message.reply_text("❌ Уже добавлены 2 чата. Сначала удали один в админке.")
-            raise ApplicationHandlerStop
-        allowed_chat_ids.add(chat_id)
-        context.user_data["waiting_access_chat"] = False
-        await message.reply_text(f"✅ Чат `{chat_id}` добавлен в разрешённые.", parse_mode="Markdown")
+        await _handle_access_input(message, context)
         raise ApplicationHandlerStop
 
-    # =====================================================
-    # ЦЕНА ЛУДКИ
-    # =====================================================
+    # ---------- ЦЕНА ЛУДКИ ----------
     if context.user_data.get("waiting_ludka_price"):
-        if not message.text:
-            await message.reply_text("❌ Отправь число, например: 1 или 5.")
+        try:
+            value = int((message.text or "").strip())
+            if not 1 <= value <= 100000:
+                raise ValueError
+        except ValueError:
+            await message.reply_text("❌ Укажи целое число от 1 до 100000.")
             raise ApplicationHandlerStop
 
-        try:
-            value = int(message.text.strip())
-            if value < 1 or value > 100000:
-                raise ValueError
-
-            ludka_price = value
-            await _db_set("ludka_price", ludka_price)
-            context.user_data["waiting_ludka_price"] = False
-
-            await message.reply_text(
-                f"✅ Цена лудки установлена: **{ludka_price} соо**",
-                parse_mode="Markdown"
-            )
-        except ValueError:
-            await message.reply_text(
-                "❌ Укажи целое число от 1 до 100000.\n"
-                "Например: `1` или `10`.",
-                parse_mode="Markdown"
-            )
-
+        S["ludka_price"] = value
+        await _db_set("ludka_price", value)
+        context.user_data.pop("waiting_ludka_price", None)
+        await message.reply_text(
+            f"✅ Цена лудки: {b(value)} соо", parse_mode=ParseMode.HTML
+        )
         raise ApplicationHandlerStop
 
-    # =====================================================
-    # ПРИЗ ЛУДКИ
-    # =====================================================
+    # ---------- ПРИЗ ЛУДКИ ----------
     if context.user_data.get("waiting_ludka_prize"):
         if not message.text:
             await message.reply_text("❌ Отправь текст приза.")
             raise ApplicationHandlerStop
-
         if len(message.text) > 4096:
-            await message.reply_text(
-                "❌ Приз слишком длинный. Максимум 4096 символов."
-            )
+            await message.reply_text("❌ Максимум 4096 символов.")
             raise ApplicationHandlerStop
 
-        ludka_prize = message.text
-        ludka_prize_entities = message.entities or []
-        await _db_set("ludka_prize", ludka_prize)
-        await _db_set_entities("ludka_prize_entities", ludka_prize_entities)
-        context.user_data["waiting_ludka_prize"] = False
+        text, entities = collect_entities(message)
+        S["ludka_prize"] = text
+        S["ludka_prize_entities"] = entities
+        await _db_set("ludka_prize", text)
+        await _db_set_entities("ludka_prize_entities", entities)
+        context.user_data.pop("waiting_ludka_prize", None)
 
-        await message.reply_text(
-            "✅ **Приз сохранён!**\n\n"
-            f"{ludka_prize}\n\n"
-            f"✨ Premium Emoji: "
-            f"{'сохранены' if ludka_prize_entities else 'нет'}",
-            entities=ludka_prize_entities,
-            parse_mode=None
+        await message.reply_text("✅ Приз сохранён:")
+        await message.reply_text(text, entities=entities or None)
+        raise ApplicationHandlerStop
+
+    # ---------- СООБЩЕНИЕ ЛУДКИ ----------
+    if context.user_data.get("waiting_ludka_message"):
+        await _save_message_setting(
+            message, context, "waiting_ludka_message",
+            text_key="ludka_text", photo_key="ludka_photo", ent_key="ludka_entities",
+            title="Сообщение лудки",
         )
         raise ApplicationHandlerStop
 
-    # =====================================================
-    # СООБЩЕНИЕ ЛУДКИ
-    # =====================================================
-    if context.user_data.get("waiting_ludka_message"):
-        if message.photo:
-            caption = message.caption or ""
-
-            if len(caption) > 1024:
-                await message.reply_text(
-                    "❌ Подпись слишком длинная. Для фотографии максимум 1024 символа."
-                )
-                raise ApplicationHandlerStop
-
-            ludka_photo = message.photo[-1].file_id
-            ludka_text = caption
-            ludka_entities = message.caption_entities or []
-            await _db_set("ludka_photo", ludka_photo)
-            await _db_set("ludka_text", ludka_text)
-            await _db_set_entities("ludka_entities", ludka_entities)
-            context.user_data["waiting_ludka_message"] = False
-
-            await message.reply_text(
-                "✅ **Сообщение лудки сохранено!**\n\n"
-                "📷 Фото: установлено\n"
-                f"📝 Текст: {ludka_text or '(без текста)'}\n"
-                f"✨ Premium Emoji: "
-                f"{'сохранены' if ludka_entities else 'нет'}",
-                parse_mode="Markdown"
-            )
-        elif message.text:
-            if len(message.text) > 4096:
-                await message.reply_text(
-                    "❌ Текст слишком длинный. Максимум 4096 символов."
-                )
-                raise ApplicationHandlerStop
-
-            ludka_text = message.text
-            ludka_photo = None
-            ludka_entities = message.entities or []
-            await _db_set("ludka_photo", "")
-            await _db_set("ludka_text", ludka_text)
-            await _db_set_entities("ludka_entities", ludka_entities)
-            context.user_data["waiting_ludka_message"] = False
-
-            await message.reply_text(
-                "✅ **Сообщение лудки сохранено!**\n\n"
-                f"{ludka_text}\n\n"
-                f"✨ Premium Emoji: "
-                f"{'сохранены' if ludka_entities else 'нет'}",
-                parse_mode="Markdown"
-            )
-        else:
-            await message.reply_text(
-                "❌ Отправь текст или фотографию с подписью."
-            )
-
+    # ---------- СООБЩЕНИЕ ПОБЕДИТЕЛЯ ----------
+    if context.user_data.get("waiting_win_message"):
+        await _save_message_setting(
+            message, context, "waiting_win_message",
+            text_key="win_text", photo_key="win_photo", ent_key="win_entities",
+            title="Сообщение победителя",
+        )
         raise ApplicationHandlerStop
 
-    # Админ сейчас ничего не настраивает.
-    if not context.user_data.get("waiting_win_message"):
+    # Админ ничего не настраивает — пропускаем дальше в обычный обработчик.
+
+
+async def _save_message_setting(
+    message, context, flag: str, text_key: str, photo_key: str, ent_key: str, title: str
+) -> None:
+    if message.photo:
+        caption, entities = collect_entities(message, is_caption=True)
+        if len(caption) > 1024:
+            await message.reply_text("❌ Для фото максимум 1024 символа.")
+            return
+
+        S[photo_key] = message.photo[-1].file_id
+        S[text_key] = caption
+        S[ent_key] = entities
+        await _db_set(photo_key, S[photo_key])
+        await _db_set(text_key, caption)
+        await _db_set_entities(ent_key, entities)
+        context.user_data.pop(flag, None)
+
+        await message.reply_text(f"✅ {title} сохранено (фото + текст). Предпросмотр:")
+        await message.reply_photo(
+            photo=S[photo_key], caption=caption, caption_entities=entities or None
+        )
         return
 
-    # =====================================================
-    # СТАРОЕ: СООБЩЕНИЕ ПОБЕДИТЕЛЯ
-    # =====================================================
-    if message.photo:
-        caption = message.caption or ""
-
-        if len(caption) > 1024:
-            await message.reply_text(
-                "❌ Подпись слишком длинная.\n\n"
-                "Для фотографии максимум 1024 символа."
-            )
-            raise ApplicationHandlerStop
-
-        photo = message.photo[-1]
-        win_photo = photo.file_id
-        win_text = caption
-        win_entities = message.caption_entities or []
-        await _db_set("win_photo", win_photo)
-        await _db_set("win_text", win_text)
-        await _db_set_entities("win_entities", win_entities)
-
-        context.user_data["waiting_win_message"] = False
-
-        await message.reply_text(
-            "✅ **Сообщение сохранено!**\n\n"
-            "📷 Фото: установлено\n"
-            f"📝 Текст: {win_text or '(без текста)'}\n\n"
-            "✨ Premium Emoji: "
-            f"{'сохранены' if win_entities else 'нет'}",
-            parse_mode="Markdown"
-        )
-        raise ApplicationHandlerStop
-
     if message.text:
-        text = message.text
-
+        text, entities = collect_entities(message)
         if len(text) > 4096:
+            await message.reply_text("❌ Максимум 4096 символов.")
+            return
+
+        S[text_key] = text
+        S[photo_key] = None
+        S[ent_key] = entities
+        await _db_set(photo_key, "")
+        await _db_set(text_key, text)
+        await _db_set_entities(ent_key, entities)
+        context.user_data.pop(flag, None)
+
+        await message.reply_text(f"✅ {title} сохранено. Предпросмотр:")
+        await message.reply_text(text, entities=entities or None)
+        return
+
+    await message.reply_text("❌ Отправь текст или фото с подписью.")
+
+
+async def _handle_account_step(step: str, message, context) -> None:
+    text = (message.text or "").strip()
+
+    try:
+        if step == "api_id":
+            api_id = int(text)
+            if api_id <= 0:
+                raise ValueError("API ID должен быть положительным числом")
+            context.user_data["account_api_id"] = api_id
+            context.user_data["account_step"] = "api_hash"
             await message.reply_text(
-                "❌ Текст слишком длинный.\n\n"
-                "Максимум 4096 символов."
+                f"🔐 Шаг 2/5 — отправь {b('API HASH')} (32 символа).",
+                parse_mode=ParseMode.HTML,
             )
-            raise ApplicationHandlerStop
+            return
 
-        win_text = text
-        win_photo = None
-        win_entities = message.entities or []
-        await _db_set("win_photo", "")
-        await _db_set("win_text", win_text)
-        await _db_set_entities("win_entities", win_entities)
+        if step == "api_hash":
+            if len(text) < 20:
+                await message.reply_text("❌ API HASH выглядит некорректно. Отправь ещё раз.")
+                return
+            context.user_data["account_api_hash"] = text
+            context.user_data["account_step"] = "phone"
+            await message.reply_text(
+                "📱 Шаг 3/5 — отправь номер аккаунта в международном формате, "
+                "например <code>+37120000000</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-        context.user_data["waiting_win_message"] = False
+        if step == "phone":
+            phone = text.replace(" ", "")
+            if not phone.startswith("+"):
+                await message.reply_text("❌ Номер должен начинаться с +.")
+                return
 
+            phone_code_hash = await gift_account.start_login(
+                context.user_data["account_api_id"],
+                context.user_data["account_api_hash"],
+                phone,
+            )
+            context.user_data["account_phone"] = phone
+            context.user_data["account_phone_code_hash"] = phone_code_hash
+            context.user_data["account_step"] = "code"
+            await message.reply_text(
+                "📨 Шаг 4/5 — отправь код входа из Telegram.\n\n"
+                "Совет: вставь код с пробелами (<code>1 2 3 4 5</code>), "
+                "чтобы Telegram его не аннулировал.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if step == "code":
+            result = await gift_account.finish_login(
+                context.user_data["account_phone"],
+                text.replace(" ", ""),
+                context.user_data["account_phone_code_hash"],
+            )
+            if result.get("need_password"):
+                context.user_data["account_step"] = "password"
+                await message.reply_text("🔑 Шаг 5/5 — отправь пароль двухэтапной аутентификации.")
+                return
+
+            await _account_linked(message, context)
+            return
+
+        if step == "password":
+            await gift_account.finish_login_password(text)
+            await _account_linked(message, context)
+            return
+
+    except Exception as e:
+        log.exception("Ошибка привязки MTProto-аккаунта")
+        await gift_account.abort_login()
+        _clear_waiting(context)
         await message.reply_text(
-            "✅ **Текст сохранён!**\n\n"
-            f"{win_text}\n\n"
-            "✨ Premium Emoji: "
-            f"{'сохранены' if win_entities else 'нет'}",
-            parse_mode="Markdown"
+            f"❌ Не удалось привязать аккаунт.\n\n<code>{esc(e)}</code>\n\n"
+            "Открой /admin и попробуй заново.",
+            parse_mode=ParseMode.HTML,
         )
 
-        raise ApplicationHandlerStop
+
+async def _account_linked(message, context) -> None:
+    _clear_waiting(context)
+    try:
+        status = await gift_account.account_status()
+    except Exception:
+        status = {}
+    await message.reply_text(
+        f"✅ {b('АККАУНТ ПРИВЯЗАН!')}\n\n"
+        f"👤 {esc(status.get('name', 'Аккаунт'))}\n"
+        f"⭐ Баланс: {b(status.get('balance', '—'))} Stars\n\n"
+        "Теперь подарки победителям покупаются с этого аккаунта автоматически.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _handle_access_input(message, context) -> None:
+    value = (message.text or "").strip()
+    if not value:
+        await message.reply_text("❌ Отправь @username группы или числовой chat ID.")
+        return
+
+    if value.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(value)
+        except TelegramError as e:
+            await message.reply_text(
+                f"❌ Не удалось найти чат.\n<code>{esc(e)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if chat.type not in ("group", "supergroup"):
+            await message.reply_text("❌ Нужна группа или супергруппа.")
+            return
+        chat_id = chat.id
+    else:
+        try:
+            chat_id = int(value)
+        except ValueError:
+            await message.reply_text("❌ Нужен @username или числовой chat ID.")
+            return
+
+    if chat_id not in allowed_chat_ids and len(allowed_chat_ids) >= MAX_ALLOWED_CHATS:
+        await message.reply_text("❌ Уже добавлены 2 чата. Сначала удали один в /admin.")
+        return
+
+    allowed_chat_ids.add(chat_id)
+    await db.add_allowed_chat(chat_id)          # раньше это забывали сохранить в БД
+    context.user_data.pop("waiting_access_chat", None)
+    await message.reply_text(
+        f"✅ Чат <code>{chat_id}</code> добавлен.", parse_mode=ParseMode.HTML
+    )
+
 
 # =========================================================
 # /CANCEL
 # =========================================================
 
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    await gift_account.abort_login()
+    _clear_waiting(context)
+    await update.message.reply_text("❌ Настройка отменена.")
 
-    if (
-        update.effective_user
-        and update.effective_user.id == ADMIN_ID
-    ):
 
-        context.user_data["waiting_win_message"] = False
-        context.user_data["waiting_ludka_price"] = False
-        context.user_data["waiting_ludka_prize"] = False
-        context.user_data["waiting_ludka_message"] = False
-        context.user_data["waiting_access_chat"] = False
+# =========================================================
+# /CHANCE
+# =========================================================
 
+async def chance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text("❌ Только администратор может менять шанс.")
+        return
+
+    if not context.args:
         await update.message.reply_text(
-            "❌ Настройка отменена."
+            f"🎯 Сейчас шанс: {b(str(S['chance']) + '%')}\n\n"
+            "Примеры:\n<code>/chance 1</code>\n<code>/chance 0.5</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        value = float(context.args[0].replace(",", "."))
+        if not 0 <= value <= 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Укажи число от 0 до 100.")
+        return
+
+    S["chance"] = value
+    await _db_set("chance", value)
+    await update.message.reply_text(
+        f"✅ Шанс установлен: {b(f'{value}%')}", parse_mode=ParseMode.HTML
+    )
+
+
+# =========================================================
+# /LUDKA, /LUDKAOFF
+# =========================================================
+
+async def ludka_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text("❌ Только администратор может управлять лудкой.")
+        return
+
+    S["ludka_enabled"] = True
+    ludka_progress.clear()
+    S["ludka_chat_id"] = update.effective_chat.id
+    await _db_set("ludka_enabled", True)
+    await _db_set("ludka_chat_id", S["ludka_chat_id"])
+
+    try:
+        if S["ludka_photo"]:
+            await update.message.reply_photo(
+                photo=S["ludka_photo"],
+                caption=S["ludka_text"],
+                caption_entities=S["ludka_entities"] or None,
+            )
+        else:
+            await update.message.reply_text(
+                S["ludka_text"], entities=S["ludka_entities"] or None
+            )
+    except Exception:
+        log.exception("Ошибка публикации лудки")
+        await update.message.reply_text("❌ Не удалось опубликовать сообщение лудки.")
+        return
+
+    await update.message.reply_text(
+        f"🎰 Лудка {b('запущена')}!\n"
+        f"💰 Цена 1 вращения: {b(S['ludka_price'])} соо",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def ludkaoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+    S["ludka_enabled"] = False
+    ludka_progress.clear()
+    await _db_set("ludka_enabled", False)
+    await update.message.reply_text("⛔ Лудка 777 остановлена.")
+
+
+# =========================================================
+# /REFUND — возврат звёзд
+# =========================================================
+
+async def refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return
+
+    if not context.args:
+        payments = await db.last_payments(10)
+        if not payments:
+            await update.message.reply_text("Платежей пока нет.")
+            return
+        lines = [f"💸 {b('ПОСЛЕДНИЕ ПЛАТЕЖИ')}", ""]
+        for p in payments:
+            lines.append(
+                f"⭐ {p['amount']} — {esc(p['payload'])}\n"
+                f"👤 <code>{p['user_id']}</code>\n"
+                f"<code>/refund {esc(p['charge_id'])}</code>\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    charge_id = context.args[0]
+    payment = await db.get_payment(charge_id)
+    if not payment:
+        await update.message.reply_text("❌ Платёж не найден.")
+        return
+
+    try:
+        await context.bot.refund_star_payment(int(payment["user_id"]), charge_id)
+        await update.message.reply_text("✅ Звёзды возвращены.")
+    except TelegramError as e:
+        await update.message.reply_text(
+            f"❌ Возврат не удался:\n<code>{esc(e)}</code>", parse_mode=ParseMode.HTML
         )
 
 
@@ -1810,527 +1757,219 @@ async def cancel_command(
 # ПРОВЕРКА ДОСТУПА
 # =========================================================
 
-async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat:
+async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
         return
 
-    # Админ может управлять ботом в любом чате.
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
+    # Личка открыта всем: там магазин /start и оплата.
+    if chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
-    if update.effective_chat.type == "private" or chat_id not in allowed_chat_ids:
-        if update.message:
+    if is_admin(update):
+        return
+
+    if chat.id in allowed_chat_ids:
+        return
+
+    # Не спамим: одно предупреждение в час на чат.
+    now = time.time()
+    last = _denied_notice.get(chat.id, 0)
+    if now - last > 3600 and update.message:
+        _denied_notice[chat.id] = now
+        _prune(_denied_notice, 500)
+        try:
             await update.message.reply_text(ACCESS_DENIED_TEXT)
-        raise ApplicationHandlerStop
+        except TelegramError:
+            pass
+
+    raise ApplicationHandlerStop
+
 
 # =========================================================
 # ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 # =========================================================
 
-async def message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user or user.is_bot:
         return
-
 
     stats["messages"] += 1
-
-
     await _db_inc_stat("messages")
-    # Лудка 777 работает независимо от обычного розыгрыша
-    if (
-        ludka_enabled
-        and update.effective_user
-        and not update.effective_user.is_bot
-    ):
+
+    if S["ludka_enabled"]:
         await process_ludka_message(update, context)
 
-
-    # Розыгрыш выключен
-    if not giveaway_enabled:
+    if not S["giveaway_enabled"]:
         return
 
-
-    # Ботов не учитываем
-    if (
-        update.effective_user
-        and update.effective_user.is_bot
-    ):
-
+    chance = get_chance(user.id)
+    if random.random() * 100 >= chance:
         return
-
-
-    # -----------------------------------------------------
-    # ПОЛУЧАЕМ ШАНС
-    # -----------------------------------------------------
-
-    chance = get_chance(context)
-
-
-    # -----------------------------------------------------
-    # РАНДОМ
-    # -----------------------------------------------------
-
-    roll = random.random() * 100
-
-
-    if roll >= chance:
-
-        return
-
 
     stats["wins"] += 1
-
-
     await _db_inc_stat("wins")
-    # -----------------------------------------------------
-    # ПЫТАЕМСЯ ОТПРАВИТЬ ПОДАРОК
-    # -----------------------------------------------------
 
-    success = await give_gift(
-        update,
-        context
-    )
-
-
-    # =====================================================
-    # ПОДАРОК ОТПРАВЛЕН
-    # =====================================================
-
-    if success:
-
-        await update.message.reply_text(
-
-            "🎉 **ПОЗДРАВЛЯЕМ!**\n\n"
-            "Ты выиграл настоящий "
-            "Telegram-подарок! 🎁",
-
-            parse_mode="Markdown"
+    if await give_gift(update, context):
+        await message.reply_text(
+            f"🎉 {b('ПОЗДРАВЛЯЕМ!')}\n\nТы выиграл настоящий Telegram-подарок! 🎁",
+            parse_mode=ParseMode.HTML,
         )
-
         return
 
-
-    # =====================================================
-    # ПОДАРОК НЕ УДАЛОСЬ ОТПРАВИТЬ
-    # =====================================================
-
+    # Подарок не ушёл — отправляем запасное сообщение
     try:
-
-        if win_photo:
-
-            await update.message.reply_photo(
-
-                photo=win_photo,
-
-                caption=win_text,
-
-                caption_entities=win_entities
-
+        if S["win_photo"]:
+            await message.reply_photo(
+                photo=S["win_photo"],
+                caption=S["win_text"],
+                caption_entities=S["win_entities"] or None,
             )
-
         else:
-
-            await update.message.reply_text(
-
-                text=win_text,
-
-                entities=win_entities
-
+            await message.reply_text(
+                S["win_text"], entities=S["win_entities"] or None
             )
-
-
-    except Exception as e:
-
-        logging.exception(
-            "Ошибка отправки сообщения победителя"
-        )
-
+    except Exception:
+        log.exception("Ошибка отправки сообщения победителя")
         stats["errors"] += 1
-
         await _db_inc_stat("errors")
+
+
 # =========================================================
 # ЛУДКА 777 — ИГРОВОЙ ПРОЦЕСС
 # =========================================================
 
-async def process_ludka_message(update, context):
-    global ludka_progress
-
+async def process_ludka_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.message:
+    message = update.message
+    if not user or not message:
         return
 
-    user_id = user.id
-    count = ludka_progress.get(user_id, 0) + 1
-    ludka_progress[user_id] = count
+    count = ludka_progress.get(user.id, 0) + 1
+    ludka_progress[user.id] = count
+    _prune(ludka_progress)
 
-    if count < ludka_price:
+    if count < int(S["ludka_price"]):
         return
 
-    # Сбрасываем накопленные сообщения перед вращением.
-    ludka_progress[user_id] = 0
+    ludka_progress[user.id] = 0
 
-    # Три барабана от 1 до 7.
     reels = [random.randint(1, 7) for _ in range(3)]
     result = " | ".join(str(x) for x in reels)
 
     if reels == [7, 7, 7]:
-        await update.message.reply_text(
-            "🎰 **777! ДЖЕКПОТ!**\n\n"
+        await message.reply_text(
+            f"🎰 {b('777! ДЖЕКПОТ!')}\n\n"
             f"👤 {user.mention_html()}\n"
             f"🎰 {result}",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML,
         )
-        # Отдельным сообщением сохраняем исходные Telegram entities приза.
-        await update.message.reply_text(
-            ludka_prize,
-            entities=ludka_prize_entities or None
+        await message.reply_text(
+            S["ludka_prize"], entities=S["ludka_prize_entities"] or None
         )
     else:
-        await update.message.reply_text(
+        await message.reply_text(
             f"🎰 {result}\n"
             f"😔 Не повезло. Нужны три семёрки!\n"
-            f"💰 Цена вращения: {ludka_price} соо"
+            f"💰 Цена вращения: {S['ludka_price']} соо"
         )
 
 
 # =========================================================
-# /CHANCE
+# ОБРАБОТКА ОШИБОК
 # =========================================================
 
-async def chance_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not await is_admin(update, context):
-
-        await update.message.reply_text(
-            "❌ Только администратор может менять шанс."
-        )
-
-        return
-
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            f"🎯 Сейчас шанс: "
-            f"{get_chance(context)}%\n\n"
-
-            "Примеры:\n"
-            "/chance 1\n"
-            "/chance 5\n"
-            "/chance 0.5"
-        )
-
-        return
-
-
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Необработанная ошибка", exc_info=context.error)
+    stats["errors"] += 1
     try:
-
-        value = float(
-            context.args[0]
-        )
-
-
-        if value < 0 or value > 100:
-
-            raise ValueError
-
-
-        context.chat_data[
-            "chance"
-        ] = value
-
-
-        await update.message.reply_text(
-
-            f"✅ Шанс установлен: **{value}%**",
-
-            parse_mode="Markdown"
-        )
-
-
-    except ValueError:
-
-        await update.message.reply_text(
-
-            "❌ Укажи число от 0 до 100.\n\n"
-            "Например:\n"
-            "/chance 1\n"
-            "/chance 0.5"
-        )
-
-
-# =========================================================
-# /ЛУДКА
-# =========================================================
-
-async def ludka_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ludka_enabled, ludka_progress, ludka_chat_id
-
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Только администратор может управлять лудкой.")
-        return
-
-    ludka_enabled = True
-    ludka_progress = {}
-    await _db_set("ludka_enabled", True)
-    ludka_chat_id = update.effective_chat.id
-
-    try:
-        if ludka_photo:
-            await update.message.reply_photo(
-                photo=ludka_photo,
-                caption=ludka_text,
-                caption_entities=ludka_entities or []
-            )
-        else:
-            await update.message.reply_text(
-                text=ludka_text,
-                entities=ludka_entities or []
-            )
-    except Exception:
-        logging.exception("Ошибка публикации лудки")
-        await update.message.reply_text("❌ Не удалось опубликовать лудку.")
-        return
-
-    await update.message.reply_text(
-        "🎰 Лудка **запущена**!\n\n"
-        f"🎁 Приз: {ludka_prize}\n"
-        f"💰 Цена 1 соо: {ludka_price}",
-        parse_mode="Markdown"
-    )
-
-
-async def ludkaoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ludka_enabled, ludka_progress
-
-    if not await is_admin(update, context):
-        return
-
-    ludka_enabled = False
-    ludka_progress = {}
-    await _db_set("ludka_enabled", False)
-    await update.message.reply_text("⛔ Лудка 777 остановлена.")
-
-
-# =========================================================
-# /START
-# =========================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-
-        "🎁 **Telegram Gift Bot**\n\n"
-
-        "Бот случайно разыгрывает "
-        "настоящие Telegram-подарки.\n\n"
-
-        "🎯 Шанс зависит от настроек администратора.",
-
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-
-async def post_init(application):
-    await db.init_db()
-    await load_persistent_state()
-
-
-async def post_shutdown(application):
-    await gift_account.abort_login()
-    try:
-        client = await gift_account.get_client()
-        if client is not None:
-            await client.disconnect()
+        await _db_inc_stat("errors")
     except Exception:
         pass
+
+
+# =========================================================
+# ЖИЗНЕННЫЙ ЦИКЛ
+# =========================================================
+
+async def post_init(application) -> None:
+    await db.init_db()
+    await load_persistent_state()
+    await restore_closed_chats(application)
+    log.info("Бот инициализирован")
+
+
+async def post_shutdown(application) -> None:
+    for task in list(_tasks):
+        task.cancel()
+    await asyncio.gather(*_tasks, return_exceptions=True)
+
+    await gift_account.close()
     await db.close_db()
 
+    if _http_server is not None:
+        try:
+            _http_server.shutdown()
+            _http_server.server_close()
+        except Exception:
+            pass
+    log.info("Бот остановлен корректно")
 
-def main():
 
-    # HTTP для Render
-    threading.Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
+def main() -> None:
+    threading.Thread(target=run_web_server, daemon=True).start()
 
-
-    # Создаём приложение
     app = (
-        Application
-        .builder()
+        Application.builder()
         .token(TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
 
+    # --- ограничение по чатам (выполняется раньше всего) ---
+    app.add_handler(MessageHandler(filters.ALL, access_guard), group=-1)
 
-    # -----------------------------------------------------
-    # COMMANDS
-    # -----------------------------------------------------
+    # --- команды ---
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("chance", chance_command))
+    app.add_handler(CommandHandler("bold", bold_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("ludka", ludka_command))
+    app.add_handler(CommandHandler("ludkaoff", ludkaoff_command))
+    app.add_handler(CommandHandler("refund", refund_command))
 
+    # --- платежи ---
+    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
-        )
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
     )
 
+    # --- callback-кнопки ---
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy:"))
+    app.add_handler(CallbackQueryHandler(select_gift, pattern=r"^gift:"))
+    app.add_handler(CallbackQueryHandler(admin_callback))
 
+    # --- ввод админа ---
     app.add_handler(
-        CommandHandler(
-            "admin",
-            admin_command
-        )
+        MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND),
+                       admin_content_handler),
+        group=0,
     )
 
-
+    # --- обычные сообщения ---
     app.add_handler(
-        CommandHandler(
-            "chance",
-            chance_command
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler), group=1
     )
 
+    app.add_error_handler(error_handler)
 
-    app.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel_command
-        )
-    )
+    log.info("🎁 Telegram Gift Bot запущен")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-    app.add_handler(
-        CommandHandler(
-            "ludka",
-            ludka_command
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "ludkaoff",
-            ludkaoff_command
-        )
-    )
-
-
-    # -----------------------------------------------------
-    # CALLBACKS
-    # -----------------------------------------------------
-
-    app.add_handler(
-
-        CallbackQueryHandler(
-
-            admin_callback,
-
-            pattern=(
-                r"^(main|chance|gifts|balance|stats|"
-                r"toggle|refresh|account|account:connect|account:refresh|account:disconnect|account:cancel|setchance:.*|winmessage|"
-                r"access|access_add_current|access_add_username|access_clear|access_remove:.*|"
-                r"ludka|ludka_price|ludka_prize|"
-                r"ludka_message|ludka_launch|ludka_stop)$"
-            )
-        )
-    )
-
-
-    app.add_handler(
-
-        CallbackQueryHandler(
-
-            select_gift,
-
-            pattern=r"^gift:"
-        )
-    )
-
-
-    # -----------------------------------------------------
-    # ОГРАНИЧЕНИЕ ПО ЧАТАМ
-    # -----------------------------------------------------
-    app.add_handler(
-        MessageHandler(filters.ALL, access_guard),
-        group=-1
-    )
-
-
-    # -----------------------------------------------------
-    # НАСТРОЙКА СООБЩЕНИЯ АДМИНОМ
-    #
-    # Сначала ловим фото и обычный текст.
-    # Если админ сейчас находится в режиме настройки,
-    # сообщение будет обработано здесь.
-    # -----------------------------------------------------
-
-    admin_input_filter = (
-        filters.PHOTO
-        |
-        (filters.TEXT & ~filters.COMMAND)
-    )
-
-
-    app.add_handler(
-
-        MessageHandler(
-            admin_input_filter,
-            admin_content_handler
-        ),
-
-        group=0
-    )
-
-
-    # -----------------------------------------------------
-    # ОБЫЧНЫЕ СООБЩЕНИЯ
-    # -----------------------------------------------------
-
-    app.add_handler(
-
-        MessageHandler(
-
-            filters.TEXT & ~filters.COMMAND,
-
-            message_handler
-
-        ),
-
-        group=1
-    )
-
-
-    print(
-        "🎁 Telegram Gift Bot запущен!"
-    )
-
-
-    # Запуск
-    app.run_polling()
-
-
-# =========================================================
-# START
-# =========================================================
 
 if __name__ == "__main__":
     main()
