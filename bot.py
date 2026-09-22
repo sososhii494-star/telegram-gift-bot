@@ -4167,3 +4167,845 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+import json
+import time
+from typing import Dict, List, Optional
+
+from telegram import (
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MessageEntity,
+)
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+from telegram.ext import ApplicationHandlerStop
+
+
+# =====================================================================
+# [A] КОНСТАНТЫ
+# =====================================================================
+
+DEFAULT_COMMENT_TEXT = "🔥 Не забудь подписаться и забрать мишку!"
+
+DEFAULT_ANTISPAM_TEXT = (
+    "🚫 {user}, мут на {minutes} минут.\n"
+    "Причина: спам сообщениями / фарм мишек."
+)
+
+ANTISPAM_DEFAULT_LIMIT   = 10     # больше 10 сообщений за окно = спам
+ANTISPAM_DEFAULT_WINDOW  = 60     # окно, секунд
+ANTISPAM_DEFAULT_MUTE    = 20     # мут, минут
+ANTISPAM_DEFAULT_REMIND  = 15     # напоминание в чат каждые 15 минут (0 = выкл)
+COMMENT_DEDUP_LIMIT      = 500    # сколько обработанных постов помним
+MUTES_SETTING_KEY        = "active_mutes_json"
+
+# Права: полностью открытый участник / полный мут
+OPEN_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+CLOSED_PERMS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+# ВНИМАНИЕ: если у тебя OPEN_PERMS/CLOSED_PERMS уже определены — удали эти
+# два определения, чтобы не перезатирать свои.
+
+
+# =====================================================================
+# [B] НАСТРОЙКИ — ВСТАВИТЬ ВНУТРЬ СЛОВАРЯ S
+# =====================================================================
+#     # --- автокомментарий под постами канала ---
+#     "comment_enabled": False,
+#     "comment_text": DEFAULT_COMMENT_TEXT,
+#     "comment_photo": None,          # file_id или URL
+#     "comment_entities": [],         # форматирование (жирный и т.п.)
+#     "comment_channel_id": None,     # канал, чьи посты комментируем
+#     "comment_group_id": None,       # связанная группа обсуждения (None = определить самой)
+#
+#     # --- антиспам ---
+#     "antispam_enabled": True,
+#     "antispam_limit": ANTISPAM_DEFAULT_LIMIT,
+#     "antispam_window": ANTISPAM_DEFAULT_WINDOW,
+#     "antispam_mute_minutes": ANTISPAM_DEFAULT_MUTE,
+#     "antispam_remind_minutes": ANTISPAM_DEFAULT_REMIND,
+#     "antispam_text": DEFAULT_ANTISPAM_TEXT,
+#     "antispam_photo": None,
+#     "antispam_entities": [],
+#     "antispam_chat_wide": False,    # False = мут нарушителю, True = закрыть чат целиком
+#     "antispam_delete_spam": False,  # удалять поток спам-сообщений при муте
+
+
+# =====================================================================
+# [C] СОСТОЯНИЕ В ПАМЯТИ — рядом с другими глобальными словарями
+# =====================================================================
+
+spam_hits: Dict[int, List[float]] = {}     # user_id -> [таймстемпы сообщений]
+active_mutes: Dict[str, float] = {}        # "chat_id:user_id" -> время конца мута
+comment_done: set = set()                  # уже прокомментированные посты/альбомы
+
+
+# =====================================================================
+# [D] ЗАГРУЗКА НАСТРОЕК — В КОНЕЦ load_persistent_state()
+# =====================================================================
+
+async def load_comments_antispam_state() -> None:
+    """Вызвать в конце load_persistent_state()."""
+    S["comment_enabled"]    = await db.get_bool_setting("comment_enabled", False)
+    S["comment_text"]       = await db.get_setting("comment_text", DEFAULT_COMMENT_TEXT)
+    S["comment_photo"]      = await db.get_setting("comment_photo", None) or None
+    S["comment_entities"]   = _entities_from_json(await db.get_setting("comment_entities", "[]"))
+    S["comment_channel_id"] = await db.get_int_setting("comment_channel_id", 0) or None
+    S["comment_group_id"]   = await db.get_int_setting("comment_group_id", 0) or None
+
+    S["antispam_enabled"]       = await db.get_bool_setting("antispam_enabled", True)
+    S["antispam_limit"]         = max(2, await db.get_int_setting("antispam_limit", ANTISPAM_DEFAULT_LIMIT))
+    S["antispam_window"]        = max(5, await db.get_int_setting("antispam_window", ANTISPAM_DEFAULT_WINDOW))
+    S["antispam_mute_minutes"]  = max(1, await db.get_int_setting("antispam_mute_minutes", ANTISPAM_DEFAULT_MUTE))
+    S["antispam_remind_minutes"] = max(0, await db.get_int_setting("antispam_remind_minutes", ANTISPAM_DEFAULT_REMIND))
+    S["antispam_text"]          = await db.get_setting("antispam_text", DEFAULT_ANTISPAM_TEXT)
+    S["antispam_photo"]         = await db.get_setting("antispam_photo", None) or None
+    S["antispam_entities"]      = _entities_from_json(await db.get_setting("antispam_entities", "[]"))
+    S["antispam_chat_wide"]     = await db.get_bool_setting("antispam_chat_wide", False)
+    S["antispam_delete_spam"]   = await db.get_bool_setting("antispam_delete_spam", False)
+
+    # активные муты, пережившие рестарт
+    active_mutes.clear()
+    raw = await db.get_setting(MUTES_SETTING_KEY, "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        data = {}
+    for key, until in (data or {}).items():
+        try:
+            until = float(until)
+        except (TypeError, ValueError):
+            continue
+        if until > time.time():
+            active_mutes[key] = until
+
+
+# =====================================================================
+# [E] ХЕЛПЕРЫ (если чего-то ещё нет у тебя)
+# =====================================================================
+
+def _u16(text: str) -> int:
+    """Длина строки в UTF-16 code units (так Telegram считает offset'ы)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _entities_to_json(ents) -> str:
+    return json.dumps([e.to_dict() for e in (ents or [])], ensure_ascii=False)
+
+
+def _entities_from_json(raw) -> list:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for d in data or []:
+        try:
+            out.append(MessageEntity(**d))
+        except Exception:
+            continue
+    return out
+
+
+def parse_bold_markers(text: str):
+    """Превращает **жирный** в обычный текст + entity BOLD.
+    Возвращает (чистый_текст, [entities])."""
+    out: List[str] = []
+    ents: List[MessageEntity] = []
+    i = 0
+    pos16 = 0
+    while i < len(text):
+        if text.startswith("**", i):
+            end = text.find("**", i + 2)
+            if end != -1:
+                inner = text[i + 2:end]
+                if inner:
+                    ents.append(MessageEntity(MessageEntity.BOLD, pos16, _u16(inner)))
+                    out.append(inner)
+                    pos16 += _u16(inner)
+                    i = end + 2
+                    continue
+        out.append(text[i])
+        pos16 += _u16(text[i])
+        i += 1
+    return "".join(out), ents
+
+
+async def _save_mutes() -> None:
+    await db.set_setting(MUTES_SETTING_KEY, json.dumps(active_mutes))
+
+
+async def _store_template(message, waiting_key: str, text_key: str, photo_key: str, ent_key: str) -> None:
+    """Сохраняет текст (или подпись к фото) + форматирование в настройки.
+    Для фото храним file_id — по нему бот отправит его повторно."""
+    text = message.text or message.caption or ""
+    ents = message.entities or message.caption_entities or []
+    photo_id = message.photo[-1].file_id if message.photo else None
+
+    text, parsed = parse_bold_markers(text) if "**" in text else (text, [])
+    ents_final = list(ents) + list(parsed)
+
+    S[text_key] = text
+    S[ent_key] = ents_final
+    if photo_id:
+        S[photo_key] = photo_id
+
+    await _db_set(text_key, text)
+    await _db_set(ent_key, _entities_to_json(ents_final))
+    if photo_id:
+        await _db_set(photo_key, photo_id)
+
+    return f"✅ Сохранено. Форматирование: {'да' if ents_final else 'нет'}, фото: {'да' if photo_id else 'нет'}."
+
+
+# =====================================================================
+# [F] БЛОК АНТИСПАМА
+# =====================================================================
+
+def _mute_key(chat_id: int, user_id: int) -> str:
+    return f"{chat_id}:{user_id}"
+
+
+def _render_antispam_text(user, minutes: int):
+    """→ (текст, entities, parse_mode).
+    Если в шаблоне есть {user}/{minutes}/{limit}/{window} — отдаём HTML
+    (тогда можно писать HTML-теги и переменные), иначе — сохранённое форматирование."""
+    raw = S["antispam_text"] or DEFAULT_ANTISPAM_TEXT
+    if any(p in raw for p in ("{user}", "{minutes}", "{limit}", "{window}")):
+        txt = (raw
+               .replace("{user}", user.mention_html())
+               .replace("{minutes}", str(minutes))
+               .replace("{limit}", str(S["antispam_limit"]))
+               .replace("{window}", str(S["antispam_window"])))
+        return txt, None, ParseMode.HTML
+    return raw, (S["antispam_entities"] or None), None
+
+
+async def _mute_reminder_loop(context, chat_id: int, user_id: int, until_ts: float) -> None:
+    """Пока идёт мут — напоминаем в чат каждые N минут (по умолчанию 15)."""
+    interval = int(S["antispam_remind_minutes"]) * 60
+    if interval <= 0:
+        return
+    while True:
+        left = until_ts - time.time()
+        if left <= 5:
+            return
+        await asyncio.sleep(min(interval, left))
+        if time.time() >= until_ts:
+            return
+        try:
+            await context.bot.send_message(
+                chat_id,
+                f"⏳ Мут ещё действует: {int((until_ts - time.time()) / 60) + 1} мин.\n"
+                "Причина: спам сообщениями / фарм мишек.",
+            )
+        except TelegramError:
+            return
+
+
+async def _unmute_cleanup(context, chat_id: int, user_id: int, until_ts: float) -> None:
+    """Telegram снимает мут по until_date сам — нам нужно почистить состояние."""
+    await asyncio.sleep(max(1.0, until_ts - time.time()))
+    active_mutes.pop(_mute_key(chat_id, user_id), None)
+    await _save_mutes()
+
+
+async def _apply_mute(context, chat, user, until_ts: float) -> bool:
+    minutes = int(S["antispam_mute_minutes"])
+    if S["antispam_chat_wide"]:
+        try:
+            await context.bot.set_chat_permissions(chat.id, CLOSED_PERMS)
+        except TelegramError:
+            log.exception("Антиспам: не удалось закрыть чат %s", chat.id)
+            return False
+        _spawn(_reopen_chat_later(context, chat.id, int(until_ts - time.time())))
+    else:
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat.id,
+                user_id=user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(until_ts),
+            )
+        except TelegramError:
+            log.exception("Антиспам: не удалось замутить %s в %s", user.id, chat.id)
+            return False
+    active_mutes[_mute_key(chat.id, user.id)] = until_ts
+    _prune(active_mutes, 5000)
+    await _save_mutes()
+    _spawn(_unmute_cleanup(context, chat.id, user.id, until_ts))
+    return True
+
+
+async def _reopen_chat_later(context, chat_id: int, seconds: int) -> None:
+    await asyncio.sleep(max(1, seconds))
+    try:
+        await context.bot.set_chat_permissions(chat_id, OPEN_PERMS)
+        await context.bot.send_message(chat_id, "✅ Чат снова открыт, можно писать.")
+    except TelegramError:
+        log.exception("Антиспам: не удалось открыть чат %s обратно", chat_id)
+
+
+async def antispam_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True — сообщение признано спамом, в розыгрыше участвовать не должно."""
+    if not S["antispam_enabled"]:
+        return False
+
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.message
+    if not user or not chat or not message or user.is_bot:
+        return False
+    if chat.type not in ("group", "supergroup") or chat.id not in allowed_chat_ids:
+        return False
+    if is_admin(update):
+        return False
+
+    now = time.time()
+    window = int(S["antispam_window"])
+    limit = int(S["antispam_limit"])
+
+    stamps = spam_hits.setdefault(user.id, [])
+    stamps[:] = [t for t in stamps if now - t < window]
+    stamps.append(now)
+    _prune(spam_hits, 5000)
+
+    if len(stamps) <= limit:
+        return False
+
+    stamps.clear()
+    minutes = int(S["antispam_mute_minutes"])
+    until_ts = now + minutes * 60
+
+    if S["antispam_delete_spam"]:
+        try:
+            await context.bot.delete_message(chat.id, message.message_id)
+        except TelegramError:
+            pass
+
+    if not await _apply_mute(context, chat, user, until_ts):
+        return False
+
+    _spawn(_mute_reminder_loop(context, chat.id, user.id, until_ts))
+
+    text, ents, parse_mode = _render_antispam_text(user, minutes)
+    try:
+        if S["antispam_photo"]:
+            await message.reply_photo(
+                photo=S["antispam_photo"], caption=text,
+                caption_entities=ents, parse_mode=parse_mode,
+            )
+        else:
+            await message.reply_text(text, entities=ents, parse_mode=parse_mode)
+    except TelegramError:
+        try:
+            await message.reply_text(text, parse_mode=None)   # на случай битой HTML-разметки
+        except TelegramError:
+            log.exception("Антиспам: не удалось отправить предупреждение")
+
+    await _notify_admin(
+        context,
+        f"🛡 Антиспам: {user.id} ({user.full_name}) — мут {minutes} мин "
+        f"(+{len(stamps) + limit} сообщений за {window} с) в чате {chat.id}.",
+    )
+    return True
+
+
+async def antispam_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Хендлер в group=0, до остальных: спамер не должен участвовать в розыгрыше."""
+    if await antispam_check(update, context):
+        raise ApplicationHandlerStop
+
+
+async def restore_active_mutes(application) -> None:
+    """После рестарта: снять просроченные муты, по активным — вернуть напоминания."""
+    class _Ctx:
+        bot = application.bot
+
+    changed = False
+    for key, until in list(active_mutes.items()):
+        try:
+            chat_id, user_id = (int(x) for x in key.split(":"))
+        except ValueError:
+            active_mutes.pop(key, None)
+            changed = True
+            continue
+        if until <= time.time():
+            active_mutes.pop(key, None)
+            changed = True
+            try:
+                await application.bot.restrict_chat_member(chat_id, user_id, permissions=OPEN_PERMS)
+            except TelegramError:
+                pass
+            continue
+        _spawn(_mute_reminder_loop(_Ctx(), chat_id, user_id, until))
+    if changed:
+        await _save_mutes()
+
+
+def antispam_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "⛔ Выключить" if S["antispam_enabled"] else "✅ Включить",
+            callback_data="antispam_toggle")],
+        [InlineKeyboardButton(
+            f"🔢 Лимит: >{S['antispam_limit']} за {S['antispam_window']} с",
+            callback_data="antispam_limit")],
+        [InlineKeyboardButton(
+            f"⏳ Мут: {S['antispam_mute_minutes']} мин", callback_data="antispam_mute")],
+        [InlineKeyboardButton(
+            f"🔔 Напоминать каждые {S['antispam_remind_minutes']} мин"
+            if S["antispam_remind_minutes"] else "🔔 Напоминания: выкл",
+            callback_data="antispam_remind")],
+        [InlineKeyboardButton("✏️ Текст и фото предупреждения", callback_data="antispam_text")],
+        [InlineKeyboardButton(
+            "🎯 Режим: " + ("закрыть чат целиком" if S["antispam_chat_wide"] else "мут нарушителю"),
+            callback_data="antispam_mode")],
+        [InlineKeyboardButton(
+            "🧹 Удалять спам-сообщения: " + ("да" if S["antispam_delete_spam"] else "нет"),
+            callback_data="antispam_delete")],
+        [InlineKeyboardButton("♻️ Снять все муты сейчас", callback_data="antispam_reset")],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="main")],
+    ])
+
+
+async def show_antispam_menu(query) -> None:
+    text = (
+        "🛡 <b>АНТИСПАМ</b>\n\n"
+        f"Статус: {'🟢 включён' if S['antispam_enabled'] else '🔴 выключен'}\n"
+        f"Спам: больше {S['antispam_limit']} сообщений за {S['antispam_window']} с\n"
+        f"Наказание: мут {S['antispam_mute_minutes']} мин\n"
+        f"Напоминание в чат: каждые {S['antispam_remind_minutes']} мин\n"
+        f"Активных мутов: {len(active_mutes)}\n\n"
+        "В шаблоне предупреждения доступны переменные:\n"
+        "<code>{user}</code>, <code>{minutes}</code>, <code>{limit}</code>, <code>{window}</code>"
+    )
+    await query.edit_message_text(text, reply_markup=antispam_menu_keyboard(),
+                                  parse_mode=ParseMode.HTML)
+
+
+# =====================================================================
+# [G] БЛОК КОММЕНТАРИЕВ ПОД ПОСТАМИ КАНАЛА
+# =====================================================================
+
+async def _resolve_comment_group(context, channel_id: int) -> Optional[int]:
+    if S["comment_group_id"]:
+        return int(S["comment_group_id"])
+    try:
+        chat = await context.bot.get_chat(channel_id)
+    except TelegramError:
+        log.exception("Комментарии: не удалось получить канал %s", channel_id)
+        return None
+    linked = getattr(chat, "linked_chat_id", None)
+    if linked:
+        S["comment_group_id"] = int(linked)
+        await _db_set("comment_group_id", int(linked))
+    return linked
+
+
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Первым комментарием отвечает на каждый новый пост канала."""
+    post = update.channel_post or update.edited_channel_post
+    if not post or getattr(post, "is_automatic_forward", False):
+        return
+    if not S["comment_enabled"]:
+        return
+
+    channel_id = S["comment_channel_id"]
+    if channel_id and post.chat_id != int(channel_id):
+        return
+
+    # альбом (несколько фото) — это один пост, комментируем один раз
+    dedup_key = post.media_group_id or f"msg:{post.chat_id}:{post.message_id}"
+    if dedup_key in comment_done:
+        return
+    comment_done.add(dedup_key)
+    if len(comment_done) > COMMENT_DEDUP_LIMIT:
+        for k in list(comment_done)[:len(comment_done) - COMMENT_DEDUP_LIMIT // 2]:
+            comment_done.discard(k)
+
+    group_id = await _resolve_comment_group(context, post.chat_id)
+    if not group_id:
+        await _notify_admin(
+            context,
+            "⚠️ Комментарии: у канала нет связанной группы обсуждения. "
+            "Включи «Обсуждение» в настройках канала или задай группу в админке.",
+        )
+        return
+
+    text = S["comment_text"] or DEFAULT_COMMENT_TEXT
+    ents = S["comment_entities"] or []
+    if not ents:
+        text, ents = parse_bold_markers(text)
+    if not ents:
+        # «жирным шрифтом» по умолчанию — весь комментарий жирный
+        ents = [MessageEntity(MessageEntity.BOLD, 0, _u16(text))]
+
+    try:
+        if S["comment_photo"]:
+            await context.bot.send_photo(
+                chat_id=group_id, photo=S["comment_photo"],
+                caption=text, caption_entities=ents,
+                reply_to_message_id=post.message_id,
+                allow_sending_without_reply=True,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=group_id, text=text, entities=ents,
+                reply_to_message_id=post.message_id,
+                allow_sending_without_reply=True,
+            )
+    except TelegramError:
+        log.exception("Комментарии: не удалось оставить комментарий к посту %s", post.message_id)
+        comment_done.discard(dedup_key)
+
+
+def comments_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "⛔ Выключить" if S["comment_enabled"] else "✅ Включить",
+            callback_data="comments_toggle")],
+        [InlineKeyboardButton("✏️ Текст и фото комментария", callback_data="comment_text")],
+        [InlineKeyboardButton(
+            f"📢 Канал: {S['comment_channel_id'] or 'не выбран'}", callback_data="comment_channel")],
+        [InlineKeyboardButton(
+            f"💬 Группа: {S['comment_group_id'] or 'определю сама'}", callback_data="comment_group")],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="main")],
+    ])
+
+
+async def show_comments_menu(query) -> None:
+    text = (
+        "💬 <b>КОММЕНТАРИИ ПОД ПОСТАМИ</b>\n\n"
+        f"Статус: {'🟢 включены' if S['comment_enabled'] else '🔴 выключены'}\n"
+        f"Канал: <code>{S['comment_channel_id'] or 'любой, куда добавлен бот'}</code>\n"
+        f"Группа обсуждения: <code>{S['comment_group_id'] or 'определяется автоматически'}</code>\n"
+        f"Текст: {esc(S['comment_text'] or DEFAULT_COMMENT_TEXT)[:200]}\n"
+        f"Фото: {'есть' if S['comment_photo'] else 'нет'}\n\n"
+        "Бот должен быть <b>админом канала</b> — иначе посты к нему не приходят.\n"
+        "Комментарий уходит первым сообщением сразу после публикации поста."
+    )
+    await query.edit_message_text(text, reply_markup=comments_menu_keyboard(),
+                                  parse_mode=ParseMode.HTML)
+
+
+# =====================================================================
+# [H] ПРАВКИ В admin_keyboard() — добавить в список кнопок:
+# =====================================================================
+#     [InlineKeyboardButton("💬 Комментарии к постам", callback_data="comments")],
+#     [InlineKeyboardButton(
+#         f"🛡 Антиспам: {'🟢 ВКЛ' if S['antispam_enabled'] else '🔴 ВЫКЛ'}",
+#         callback_data="antispam")],
+
+
+# =====================================================================
+# [I] ВЕТКИ В admin_callback() — дописать в начало функции
+# =====================================================================
+
+async def admin_callback_patch(query, context, data: str) -> bool:
+    """Вызови в начале admin_callback():
+           if await admin_callback_patch(query, context, data):
+               return
+       Где data = query.data (у тебя может называться иначе)."""
+
+    if data == "comments":
+        await show_comments_menu(query)
+        return True
+
+    if data == "comments_toggle":
+        S["comment_enabled"] = not S["comment_enabled"]
+        await _db_set("comment_enabled", S["comment_enabled"])
+        await show_comments_menu(query)
+        return True
+
+    if data == "comment_text":
+        _clear_waiting(context)
+        context.user_data["waiting_comment_text"] = True
+        await query.edit_message_text(
+            "✏️ <b>ТЕКСТ КОММЕНТАРИЯ</b>\n\n"
+            "Отправь текст или фото с подписью — это уйдёт первым комментарием "
+            "под каждым новым постом канала.\n\n"
+            "• можно писать <b>жирный</b> — просто отправь сообщение с форматированием "
+            "или используй **две звёздочки**;\n"
+            "• без форматирования комментарий будет жирным целиком.",
+            reply_markup=back_kb("comments"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "comment_channel":
+        _clear_waiting(context)
+        context.user_data["waiting_comment_channel"] = True
+        await query.edit_message_text(
+            "📢 <b>КАНАЛ ДЛЯ КОММЕНТАРИЕВ</b>\n\n"
+            "Отправь @username канала или его ID (например -1001234567890).\n"
+            "Бот должен быть администратором этого канала.",
+            reply_markup=back_kb("comments"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "comment_group":
+        _clear_waiting(context)
+        context.user_data["waiting_comment_group"] = True
+        await query.edit_message_text(
+            "💬 <b>ГРУППА ОБСУЖДЕНИЯ</b>\n\n"
+            "Отправь ID/@username группы или <code>0</code> — тогда определю автоматически "
+            "по связанному чату канала.",
+            reply_markup=back_kb("comments"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "antispam":
+        await show_antispam_menu(query)
+        return True
+
+    if data == "antispam_toggle":
+        S["antispam_enabled"] = not S["antispam_enabled"]
+        await _db_set("antispam_enabled", S["antispam_enabled"])
+        await show_antispam_menu(query)
+        return True
+
+    if data == "antispam_mode":
+        S["antispam_chat_wide"] = not S["antispam_chat_wide"]
+        await _db_set("antispam_chat_wide", S["antispam_chat_wide"])
+        await show_antispam_menu(query)
+        return True
+
+    if data == "antispam_delete":
+        S["antispam_delete_spam"] = not S["antispam_delete_spam"]
+        await _db_set("antispam_delete_spam", S["antispam_delete_spam"])
+        await show_antispam_menu(query)
+        return True
+
+    if data == "antispam_limit":
+        _clear_waiting(context)
+        context.user_data["waiting_antispam_limit"] = True
+        await query.edit_message_text(
+            f"🔢 <b>ЛИМИТ АНТИСПАМА</b>\n\n"
+            f"Отправь число — сколько сообщений за минуту разрешено.\n"
+            f"Сейчас: <b>{S['antispam_limit']}</b> (мут при превышении на 1).\n"
+            f"Или отправь два числа через пробел: <code>лимит окно_секунд</code>",
+            reply_markup=back_kb("antispam"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "antispam_mute":
+        _clear_waiting(context)
+        context.user_data["waiting_antispam_mute"] = True
+        await query.edit_message_text(
+            f"⏳ <b>ДЛИТЕЛЬНОСТЬ МУТА</b>\n\nОтправь число минут. Сейчас: "
+            f"<b>{S['antispam_mute_minutes']}</b>.",
+            reply_markup=back_kb("antispam"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "antispam_remind":
+        _clear_waiting(context)
+        context.user_data["waiting_antispam_remind"] = True
+        await query.edit_message_text(
+            f"🔔 <b>НАПОМИНАНИЯ О МУТЕ</b>\n\n"
+            f"Отправь, через сколько минут бот напоминает в чат, что мут ещё действует "
+            f"(0 — выключить). Сейчас: <b>{S['antispam_remind_minutes']}</b>.",
+            reply_markup=back_kb("antispam"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "antispam_text":
+        _clear_waiting(context)
+        context.user_data["waiting_antispam_text"] = True
+        await query.edit_message_text(
+            "✏️ <b>ТЕКСТ ПРЕДУПРЕЖДЕНИЯ О МУТЕ</b>\n\n"
+            "Отправь текст или фото с подписью.\n\n"
+            "Переменные: <code>{user}</code> — упоминание нарушителя, "
+            "<code>{minutes}</code> — минут мута, <code>{limit}</code>, <code>{window}</code>.\n"
+            "Если используешь переменные — можно писать HTML-теги "
+            "(&lt;b&gt;, &lt;i&gt;, &lt;code&gt;).",
+            reply_markup=back_kb("antispam"), parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    if data == "antispam_reset":
+        released = 0
+        for key, until in list(active_mutes.items()):
+            try:
+                chat_id, user_id = (int(x) for x in key.split(":"))
+            except ValueError:
+                active_mutes.pop(key, None)
+                continue
+            try:
+                await context.bot.restrict_chat_member(chat_id, user_id, permissions=OPEN_PERMS)
+                released += 1
+            except TelegramError:
+                log.exception("Антиспам: не удалось снять мут с %s", user_id)
+            active_mutes.pop(key, None)
+        await _save_mutes()
+        await query.edit_message_text(
+            f"♻️ Муты сняты: {released}.", reply_markup=antispam_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    return False
+
+
+# =====================================================================
+# [J] ВВОД ИЗ АДМИНКИ — дописать в начало admin_content_handler()
+#     (до обработки остальных waiting_*)
+# =====================================================================
+
+NUMERIC_WAITINGS = {
+    "waiting_antispam_limit":  ("antispam_limit", 2, 1000, "Лимит сообщений за окно"),
+    "waiting_antispam_mute":   ("antispam_mute_minutes", 1, 10080, "Длительность мута, минут"),
+    "waiting_antispam_remind": ("antispam_remind_minutes", 0, 1440, "Напоминание, минут"),
+}
+
+
+async def admin_content_patch(message, context) -> bool:
+    """Вызови в начале admin_content_handler():
+           if await admin_content_patch(message, context):
+               return
+    """
+    ud = context.user_data
+
+    # --- числовые настройки антиспама ---
+    for wkey, (skey, lo, hi, title) in NUMERIC_WAITINGS.items():
+        if ud.get(wkey):
+            raw = (message.text or "").strip()
+            if not raw.isdigit():
+                await message.reply_text("❌ Нужно целое число. Попробуй ещё раз.")
+                return True
+            value = max(lo, min(hi, int(raw)))
+            S[skey] = value
+            await _db_set(skey, value)
+            ud.pop(wkey, None)
+            await message.reply_text(f"✅ {title}: <b>{value}</b>", parse_mode=ParseMode.HTML)
+            return True
+
+    # --- лимит + окно одной строкой: "10 60" ---
+    if ud.get("waiting_antispam_limit"):
+        parts = (message.text or "").replace(",", " ").split()
+        if not parts or not all(p.isdigit() for p in parts):
+            await message.reply_text("❌ Отправь число или два числа: <code>10 60</code>",
+                                     parse_mode=ParseMode.HTML)
+            return True
+        S["antispam_limit"] = max(2, min(1000, int(parts[0])))
+        if len(parts) > 1:
+            S["antispam_window"] = max(5, min(3600, int(parts[1])))
+        await _db_set("antispam_limit", S["antispam_limit"])
+        await _db_set("antispam_window", S["antispam_window"])
+        ud.pop("waiting_antispam_limit", None)
+        await message.reply_text(
+            f"✅ Спам: больше <b>{S['antispam_limit']}</b> сообщений "
+            f"за <b>{S['antispam_window']}</b> с", parse_mode=ParseMode.HTML)
+        return True
+
+    # --- текст/фото комментария и предупреждения ---
+    if ud.get("waiting_comment_text"):
+        note = await _store_template(message, "waiting_comment_text",
+                                     "comment_text", "comment_photo", "comment_entities")
+        ud.pop("waiting_comment_text", None)
+        await message.reply_text(note + "\n💬 Комментарий под постами обновлён.")
+        return True
+
+    if ud.get("waiting_antispam_text"):
+        note = await _store_template(message, "waiting_antispam_text",
+                                     "antispam_text", "antispam_photo", "antispam_entities")
+        ud.pop("waiting_antispam_text", None)
+        await message.reply_text(note + "\n🛡 Предупреждение антиспама обновлено.")
+        return True
+
+    # --- привязка канала ---
+    if ud.get("waiting_comment_channel"):
+        raw = (message.text or "").strip()
+        ud.pop("waiting_comment_channel", None)
+        try:
+            chat = await context.bot.get_chat(raw)
+            S["comment_channel_id"] = chat.id
+            S["comment_group_id"] = None          # пересчитаем для нового канала
+            await _db_set("comment_channel_id", chat.id)
+            await _db_set("comment_group_id", 0)
+            await message.reply_text(
+                f"✅ Канал привязан: <code>{chat.id}</code>", parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            await message.reply_text(
+                f"❌ Не нашёл канал: {esc(str(e))}", parse_mode=ParseMode.HTML)
+        return True
+
+    # --- привязка группы обсуждения ---
+    if ud.get("waiting_comment_group"):
+        raw = (message.text or "").strip()
+        ud.pop("waiting_comment_group", None)
+        if raw == "0":
+            S["comment_group_id"] = None
+            await _db_set("comment_group_id", 0)
+            await message.reply_text("✅ Буду определять группу обсуждения автоматически.")
+            return True
+        try:
+            gid = int(raw) if raw.lstrip("-").isdigit() else (await context.bot.get_chat(raw)).id
+        except TelegramError as e:
+            await message.reply_text(
+                f"❌ Не нашёл группу: {esc(str(e))}", parse_mode=ParseMode.HTML)
+            return True
+        S["comment_group_id"] = gid
+        await _db_set("comment_group_id", gid)
+        await message.reply_text(f"✅ Группа обсуждения: <code>{gid}</code>",
+                                 parse_mode=ParseMode.HTML)
+        return True
+
+    return False
+
+
+# =====================================================================
+# [K] ПРАВКА access_guard() — чтобы посты канала не отсекались как «чужой чат»
+# =====================================================================
+#     if chat.type == "private":
+#         return
+#     if chat.type == "channel":
+#         return          # посты канала обрабатывает channel_post_handler
+#     ...дальше твоя существующая логика...
+
+
+# =====================================================================
+# [L] main() И post_init()
+# =====================================================================
+# В main(), ПОСЛЕ app.add_handler(MessageHandler(filters.ALL, access_guard), group=-1):
+#
+#     # 1) посты канала → автокомментарий
+#     app.add_handler(
+#         MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler), group=0)
+#     # 2) антиспам — раньше остальных обработчиков группы
+#     app.add_handler(
+#         MessageHandler(filters.ALL & ~filters.COMMAND, antispam_guard), group=0)
+#
+# В post_init() ПОСЛЕ await restore_closed_chats(application):
+#
+#     await restore_active_mutes(application)
+#
+# И в load_persistent_state() в конце:
+#
+#     await load_comments_antispam_state()
