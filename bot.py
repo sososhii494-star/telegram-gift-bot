@@ -3288,7 +3288,7 @@ async def _send_blocked_message(message) -> None:
 async def _send_gift_to_user(
     user, context: ContextTypes.DEFAULT_TYPE,
     gift_id: Optional[str] = None,
-    congrats_text: str = "🎁 Поздравляем! Ты выиграл подарок!",
+    congrats_text: str = "",
 ) -> bool:
     """Общая логика отправки настоящего Telegram-подарка через MTProto.
     Если gift_id не задан — берётся общий выбор (S['selected_gift_id']) или
